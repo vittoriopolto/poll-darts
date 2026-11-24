@@ -95,7 +95,9 @@ HELP_ADMIN = (
     "/sessioni – elenco delle ultime sessioni\n"
     "/risultati_sessione <i>id</i> – inserisci i vincitori (riprende da dove eri rimasto)\n"
     "/risultati_sessione <i>id</i> tutte – rivedi/correggi tutti i risultati\n"
-    "/elimina_sessione <i>id</i> – elimina una sessione\n\n"
+    "/delete_event <i>id o nome</i> – elimina un evento (con o senza le sue sessioni)\n"
+    "/delete_session <i>id</i> – elimina una sessione con partite e voti\n"
+    "/delete_match <i>id_sessione</i> [<i>n° partita</i>] – elimina una partita e i suoi voti\n\n"
     "<b>Comandi admin (nel gruppo)</b>\n"
     "/lancia_sondaggi <i>id</i> – muta il gruppo, pubblica copertina e sondaggi\n"
     "/muta, /smuta – muta/smuta il gruppo a mano\n\n"
@@ -225,30 +227,160 @@ async def cmd_sessions(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await reply(update, "\n".join(out))
 
 
+def _private_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
+    return is_admin(update, ctx) and update.effective_chat.type == ChatType.PRIVATE
+
+
+async def _stop_open_polls(ctx: ContextTypes.DEFAULT_TYPE, s: Session, matches: list[Match]) -> int:
+    """Chiude su Telegram i sondaggi ancora aperti di una sessione che sta per essere eliminata."""
+    if not s.chat_id or s.closed_at:
+        return 0
+    n = 0
+    for m in matches:
+        if m.poll_message_id:
+            try:
+                await ctx.bot.stop_poll(s.chat_id, m.poll_message_id)
+                n += 1
+            except TelegramError:
+                pass
+    return n
+
+
+NO_KB = InlineKeyboardButton("❌ Annulla", callback_data="delx")
+
+
 async def cmd_delete_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update, ctx) or update.effective_chat.type != ChatType.PRIVATE:
+    if not _private_admin(update, ctx):
         return
     sid = parse_session_arg(ctx)
     s = await db(ctx).get_session(sid) if sid else None
     if not s:
-        await reply(update, "Uso: /elimina_sessione <i>id</i> (vedi /sessioni)")
+        await reply(update, "Uso: /delete_session <i>id</i> (vedi /sessioni)")
         return
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🗑 Sì, elimina", callback_data=f"del:{sid}"),
-                                InlineKeyboardButton("No", callback_data="del:no")]])
-    await reply(update, f"Eliminare la sessione <b>#{sid} {escape(s.name)}</b> con tutti i voti?", reply_markup=kb)
+    n_matches, n_votes = await db(ctx).session_stats(sid)
+    extra = ""
+    if s.launched_at and not s.closed_at:
+        extra = "\nI sondaggi ancora aperti nel gruppo verranno chiusi."
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🗑 Sì, elimina", callback_data=f"dels:{sid}"), NO_KB]])
+    await reply(update, f"Eliminare la sessione <b>#{sid} {escape(s.name)}</b>?\n"
+                        f"Verranno cancellate {n_matches} partite e {n_votes} voti, e spariranno dalle classifiche."
+                        f"{extra}\nI messaggi già pubblicati nel gruppo restano.", reply_markup=kb)
 
 
-async def cb_delete_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_delete_event(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _private_admin(update, ctx):
+        return
+    d = db(ctx)
+    ref = " ".join(ctx.args).strip()
+    ev = await d.find_event(ref) if ref else None
+    if not ev:
+        await reply(update, "Uso: /delete_event <i>id o nome</i> (vedi /eventi)")
+        return
+    n_s, n_m, n_v = await d.event_stats(ev.id)
+    rows = [[InlineKeyboardButton(f"🗑 Evento + {n_s} sessioni", callback_data=f"dele:{ev.id}:all")]] if n_s else []
+    rows.append([InlineKeyboardButton("🗑 Solo l'evento" + (" (le sessioni restano)" if n_s else ""),
+                                      callback_data=f"dele:{ev.id}:only")])
+    rows.append([NO_KB])
+    await reply(update, f"Eliminare l'evento <b>#{ev.id} {escape(ev.name)}</b>?\n"
+                        f"Contiene {n_s} sessioni, {n_m} partite e {n_v} voti.\n\n"
+                        f"• <b>Evento + sessioni</b>: cancella tutto, voti compresi.\n"
+                        f"• <b>Solo l'evento</b>: le sessioni restano (senza evento) e contano ancora "
+                        f"nella classifica globale.", reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def cmd_delete_match(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """/delete_match id_sessione [numero_partita]: senza numero mostra le partite come bottoni."""
+    if not _private_admin(update, ctx):
+        return
+    d = db(ctx)
+    sid = parse_session_arg(ctx)
+    s = await d.get_session(sid) if sid else None
+    if not s:
+        await reply(update, "Uso: /delete_match <i>id_sessione</i> [<i>numero partita</i>]")
+        return
+    matches = await d.get_matches(sid)
+    if len(ctx.args) > 1 and ctx.args[1].isdigit():
+        m = next((m for m in matches if m.position == int(ctx.args[1])), None)
+        if not m:
+            await reply(update, f"La sessione #{sid} non ha una partita {escape(ctx.args[1])}.")
+            return
+        await _confirm_match_delete(ctx, update.effective_chat.id, m, s)
+        return
+    if not matches:
+        await reply(update, "Questa sessione non ha partite.")
+        return
+    kb = [[InlineKeyboardButton(f"{m.position}. {m.label()}", callback_data=f"delm:{m.id}:ask")] for m in matches]
+    kb.append([NO_KB])
+    await reply(update, f"Quale partita della sessione <b>#{sid} {escape(s.name)}</b> vuoi eliminare?",
+                reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def _confirm_match_delete(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, m: Match, s: Session,
+                                edit=None) -> None:
+    n_votes = await db(ctx).match_votes(m.id)
+    poll = "\nIl suo sondaggio nel gruppo verrà chiuso." if (m.poll_message_id and not s.closed_at) else ""
+    text = (f"Eliminare la partita <b>{m.position}. {escape(m.label())}</b> (sessione #{s.id})?\n"
+            f"Verranno cancellati i suoi {n_votes} voti e i punti relativi. Le partite successive vengono "
+            f"rinumerate.{poll}")
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🗑 Sì, elimina", callback_data=f"delm:{m.id}:yes"), NO_KB]])
+    if edit:
+        await edit(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    else:
+        await ctx.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+async def cb_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
-    await q.answer()
     if not is_admin(update, ctx):
+        await q.answer("Solo admin", show_alert=True)
         return
-    arg = q.data.split(":", 1)[1]
-    if arg == "no":
+    await q.answer()
+    d = db(ctx)
+    kind, *rest = q.data.split(":")
+    if kind == "delx":
         await q.edit_message_text("Ok, non elimino nulla.")
         return
-    ok = await db(ctx).delete_session(int(arg))
-    await q.edit_message_text(f"Sessione #{arg} eliminata." if ok else "Sessione non trovata.")
+
+    if kind == "dels":
+        s = await d.get_session(int(rest[0]))
+        if not s:
+            await q.edit_message_text("Sessione non trovata (già eliminata?).")
+            return
+        stopped = await _stop_open_polls(ctx, s, await d.get_matches(s.id))
+        await d.delete_session(s.id)
+        await q.edit_message_text(f"🗑 Sessione #{s.id} {s.name} eliminata."
+                                  + (f" Chiusi {stopped} sondaggi." if stopped else ""))
+        return
+
+    if kind == "dele":
+        ev = await d.get_event(int(rest[0]))
+        if not ev:
+            await q.edit_message_text("Evento non trovato (già eliminato?).")
+            return
+        with_sessions = rest[1] == "all"
+        stopped = 0
+        if with_sessions:
+            for sid in await d.event_session_ids(ev.id):
+                s = await d.get_session(sid)
+                stopped += await _stop_open_polls(ctx, s, await d.get_matches(sid))
+        await d.delete_event(ev.id, with_sessions)
+        await q.edit_message_text(f"🗑 Evento #{ev.id} {ev.name} eliminato"
+                                  + (" con tutte le sue sessioni." if with_sessions else "; le sessioni restano.")
+                                  + (f" Chiusi {stopped} sondaggi." if stopped else ""))
+        return
+
+    if kind == "delm":
+        m = await d.get_match(int(rest[0]))
+        if not m:
+            await q.edit_message_text("Partita non trovata (già eliminata?).")
+            return
+        s = await d.get_session(m.session_id)
+        if rest[1] == "ask":
+            await _confirm_match_delete(ctx, q.message.chat.id, m, s, edit=q.edit_message_text)
+            return
+        await _stop_open_polls(ctx, s, [m])
+        await d.delete_match(m.id)
+        await q.edit_message_text(f"🗑 Partita {m.label()} eliminata dalla sessione #{s.id}.")
 
 
 # ---------------------------------------------------------------- mute / smute
@@ -785,7 +917,9 @@ def setup(app: Application) -> None:
     app.add_handler(CommandHandler(["start", "help", "aiuto"], cmd_start))
     app.add_handler(CommandHandler("mio_id", cmd_my_id))
     app.add_handler(CommandHandler("sessioni", cmd_sessions))
-    app.add_handler(CommandHandler("elimina_sessione", cmd_delete_session))
+    app.add_handler(CommandHandler(["delete_session", "elimina_sessione"], cmd_delete_session))
+    app.add_handler(CommandHandler("delete_event", cmd_delete_event))
+    app.add_handler(CommandHandler("delete_match", cmd_delete_match))
     app.add_handler(CommandHandler("lancia_sondaggi", cmd_launch))
     app.add_handler(CommandHandler("muta", cmd_mute))
     app.add_handler(CommandHandler("smuta", cmd_unmute))
@@ -800,7 +934,7 @@ def setup(app: Application) -> None:
     app.add_handler(CommandHandler("sessione_evento", cmd_session_event))
     app.add_handler(CallbackQueryHandler(cb_result, pattern=r"^r:"))
     app.add_handler(CallbackQueryHandler(cb_publish, pattern=r"^pub:"))
-    app.add_handler(CallbackQueryHandler(cb_delete_session, pattern=r"^del:"))
+    app.add_handler(CallbackQueryHandler(cb_delete, pattern=r"^del[xsem]"))
     app.add_handler(PollAnswerHandler(on_poll_answer))
     app.add_handler(ChatMemberHandler(on_chat_member, ChatMemberHandler.CHAT_MEMBER))
     # gruppo separato: registra chi scrive anche quando un comando ha già gestito il messaggio

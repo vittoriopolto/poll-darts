@@ -246,6 +246,39 @@ async def scenario():
     await h.cmd_events(upd, make_ctx(bot, cfg, database, []))
     assert "2 sessioni" in rep[0]
 
+    # --- eliminazioni
+    sid3 = await database.create_session("Da tagliare", start, ADMIN, [("A", "B"), ("C", "D"), ("E", "F")], 1)
+    ctx = make_ctx(bot, cfg, database)
+    upd, rep = make_update()
+    await h.cmd_delete_match(upd, make_ctx(bot, cfg, database, [str(sid3), "2"]))
+    ma, mc, me = await database.get_matches(sid3)
+    await h.cb_delete(make_cb(f"delm:{mc.id}:yes")[0], ctx)
+    assert [(m.position, m.label()) for m in await database.get_matches(sid3)] == [(1, "A - B"), (2, "E - F")]
+    upd, edits = make_cb("delx")
+    await h.cb_delete(upd, ctx)
+    assert "non elimino" in edits[0]
+    # sessione: chiede conferma, poi elimina
+    upd, rep = make_update()
+    await h.cmd_delete_session(upd, make_ctx(bot, cfg, database, [str(sid3)]))
+    assert "2 partite e 0 voti" in rep[0]
+    await h.cb_delete(make_cb(f"dels:{sid3}")[0], ctx)
+    assert await database.get_session(sid3) is None
+    # evento "solo evento": le sessioni restano senza evento
+    upd, rep = make_update()
+    await h.cmd_delete_event(upd, make_ctx(bot, cfg, database, ["1"]))
+    assert "Contiene 2 sessioni" in rep[0]
+    await h.cb_delete(make_cb("dele:1:only")[0], ctx)
+    assert await database.get_event(1) is None and (await database.get_session(1)).event_id is None
+    # evento "+ sessioni": cancella anche voti
+    eid = await database.create_event("Tmp", ADMIN)
+    await database.set_session_event(1, eid)
+    await h.cb_delete(make_cb(f"dele:{eid}:all")[0], ctx)
+    assert await database.get_session(1) is None and await database.ranking() == []
+    # non admin
+    upd, rep = make_update(user_id=999, chat_id=999)
+    await h.cmd_delete_session(upd, make_ctx(bot, cfg, database, [str(sid2)]))
+    assert rep == [] and await database.get_session(sid2) is not None
+
     await database.close()
 
 

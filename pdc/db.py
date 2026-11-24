@@ -190,8 +190,52 @@ class DB:
         return Session(**dict(row)) if row else None
 
     async def delete_session(self, session_id: int) -> bool:
+        """Elimina la sessione con partite e voti (ON DELETE CASCADE)."""
         res = await self.pool.execute("DELETE FROM sessions WHERE id = $1", session_id)
         return res.endswith(" 1")
+
+    async def session_stats(self, session_id: int) -> tuple[int, int]:
+        """(partite, voti) della sessione."""
+        row = await self.pool.fetchrow(
+            "SELECT count(DISTINCT m.id) AS m, count(v.user_id) AS v FROM matches m "
+            "LEFT JOIN votes v ON v.match_id = m.id WHERE m.session_id = $1", session_id)
+        return row["m"], row["v"]
+
+    async def event_stats(self, event_id: int) -> tuple[int, int, int]:
+        """(sessioni, partite, voti) dell'evento."""
+        row = await self.pool.fetchrow(
+            "SELECT count(DISTINCT s.id) AS s, count(DISTINCT m.id) AS m, count(v.user_id) AS v "
+            "FROM sessions s LEFT JOIN matches m ON m.session_id = s.id LEFT JOIN votes v ON v.match_id = m.id "
+            "WHERE s.event_id = $1", event_id)
+        return row["s"], row["m"], row["v"]
+
+    async def event_session_ids(self, event_id: int) -> list[int]:
+        return [r["id"] for r in await self.pool.fetch("SELECT id FROM sessions WHERE event_id = $1", event_id)]
+
+    async def delete_event(self, event_id: int, with_sessions: bool) -> bool:
+        """Elimina l'evento. with_sessions=True elimina anche le sue sessioni (con partite e voti),
+        altrimenti le sessioni restano senza evento."""
+        async with self.pool.acquire() as con, con.transaction():
+            if with_sessions:
+                await con.execute("DELETE FROM sessions WHERE event_id = $1", event_id)
+            res = await con.execute("DELETE FROM events WHERE id = $1", event_id)
+        return res.endswith(" 1")
+
+    async def delete_match(self, match_id: int) -> bool:
+        """Elimina una partita (e i suoi voti) e rinumera le successive."""
+        async with self.pool.acquire() as con, con.transaction():
+            row = await con.fetchrow("DELETE FROM matches WHERE id = $1 RETURNING session_id, position", match_id)
+            if row is None:
+                return False
+            # due passaggi per non violare UNIQUE(session_id, position) durante la rinumerazione
+            await con.execute("UPDATE matches SET position = -position WHERE session_id = $1 AND position > $2",
+                              row["session_id"], row["position"])
+            await con.execute("UPDATE matches SET position = -position - 1 WHERE session_id = $1 AND position < 0",
+                              row["session_id"])
+        return True
+
+    async def match_votes(self, match_id: int) -> int:
+        return await self.pool.fetchval("SELECT count(*) FROM votes WHERE match_id = $1", match_id)
 
     async def mark_launched(self, session_id: int, chat_id: int) -> None:
         await self.pool.execute(
