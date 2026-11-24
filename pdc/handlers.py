@@ -1,0 +1,678 @@
+"""Comandi e gestori del bot."""
+from __future__ import annotations
+
+import json
+import logging
+import warnings
+from datetime import datetime, timedelta, timezone
+from html import escape
+
+from telegram import (ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup, Update)
+from telegram.constants import ChatMemberStatus, ChatType, ParseMode
+from telegram.error import BadRequest, Forbidden, TelegramError
+from telegram.ext import (Application, CallbackQueryHandler, ChatMemberHandler, CommandHandler,
+                          ContextTypes, ConversationHandler, MessageHandler, PollAnswerHandler, filters)
+
+from telegram.warnings import PTBUserWarning
+
+from . import images
+from .config import Config
+from .db import DB, Match, Session
+from .parsing import ParseError, competition_positions, fmt_dt, parse_matches, parse_start
+
+log = logging.getLogger(__name__)
+
+# Utente fittizio con cui Telegram mostra gli admin anonimi nei gruppi.
+GROUP_ANONYMOUS_BOT = 1087968824
+
+ASK_NAME, ASK_MATCHES, ASK_START, ASK_CONFIRM = range(4)
+
+
+# ---------------------------------------------------------------- utilità
+
+def cfg(ctx: ContextTypes.DEFAULT_TYPE) -> Config:
+    return ctx.application.bot_data["cfg"]
+
+
+def db(ctx: ContextTypes.DEFAULT_TYPE) -> DB:
+    return ctx.application.bot_data["db"]
+
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def is_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
+    user = update.effective_user
+    if user is None:
+        return False
+    if user.id in cfg(ctx).admin_ids:
+        return True
+    # Admin anonimo del gruppo: Telegram nasconde chi è, ci fidiamo perché solo gli admin possono farlo.
+    msg = update.effective_message
+    return (user.id == GROUP_ANONYMOUS_BOT and msg is not None and msg.sender_chat is not None
+            and msg.sender_chat.id == update.effective_chat.id)
+
+
+def close_time(s: Session, c: Config) -> datetime:
+    return s.starts_at - timedelta(minutes=c.close_minutes_before)
+
+
+async def reply(update: Update, text: str, **kw):
+    return await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML,
+                                                     disable_web_page_preview=True, **kw)
+
+
+def parse_session_arg(ctx: ContextTypes.DEFAULT_TYPE) -> int | None:
+    if not ctx.args:
+        return None
+    try:
+        return int(ctx.args[0].lstrip("#"))
+    except ValueError:
+        return None
+
+
+async def register_user(ctx: ContextTypes.DEFAULT_TYPE, user, chat_id: int | None = None,
+                        status: str | None = None) -> None:
+    if user is None or user.is_bot:
+        return
+    try:
+        await db(ctx).upsert_user(user.id, user.username, user.first_name, user.last_name, chat_id, status)
+    except Exception:  # la registrazione non deve mai bloccare il resto
+        log.exception("upsert_user fallito")
+
+
+# ---------------------------------------------------------------- comandi base
+
+HELP_ADMIN = (
+    "<b>Comandi admin (in privato)</b>\n"
+    "/crea_sessione – crea una sessione (nome, partite, orario)\n"
+    "/sessioni – elenco delle ultime sessioni\n"
+    "/risultati_sessione <i>id</i> – inserisci i vincitori (riprende da dove eri rimasto)\n"
+    "/risultati_sessione <i>id</i> tutte – rivedi/correggi tutti i risultati\n"
+    "/elimina_sessione <i>id</i> – elimina una sessione\n\n"
+    "<b>Comandi admin (nel gruppo)</b>\n"
+    "/lancia_sondaggi <i>id</i> – muta il gruppo, pubblica copertina e sondaggi\n"
+    "/muta, /smuta – muta/smuta il gruppo a mano\n\n"
+)
+HELP_ALL = (
+    "<b>Comandi per tutti</b>\n"
+    "/ranking – classifica generale\n"
+    "/ranking_sessione [<i>id</i>] – classifica di una sessione (default: l'ultima)\n"
+    "/mio_id – mostra il tuo ID Telegram"
+)
+
+
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await register_user(ctx, update.effective_user)
+    text = "🎯 <b>Bot sondaggi freccette</b>\n\n" + (HELP_ADMIN if is_admin(update, ctx) else "") + HELP_ALL
+    await reply(update, text)
+
+
+async def cmd_my_id(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    u = update.effective_user
+    await reply(update, f"Il tuo ID è <code>{u.id}</code>. Chat: <code>{update.effective_chat.id}</code>")
+
+
+# ---------------------------------------------------------------- step 1: /crea_sessione
+
+async def new_session_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    if not is_admin(update, ctx):
+        await reply(update, "Solo gli admin possono creare sessioni.")
+        return ConversationHandler.END
+    ctx.user_data["new"] = {}
+    await reply(update, "🆕 Nuova sessione.\n\n1/3 – Come si chiama? (es. <i>Mercoledì pomeriggio</i>)\n\n"
+                        "/annulla per uscire.")
+    return ASK_NAME
+
+
+async def new_session_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    name = update.message.text.strip()
+    if not name or len(name) > 120:
+        await reply(update, "Nome non valido (max 120 caratteri). Riprova.")
+        return ASK_NAME
+    ctx.user_data["new"]["name"] = name
+    await reply(update, "2/3 – Mandami le partite, <b>una per riga</b>, nel formato\n"
+                        "<code>GIOCATORE 1 - GIOCATORE 2</code>\n\nEsempio:\n"
+                        "<code>Rossi - Bianchi\nVerdi - Neri</code>")
+    return ASK_MATCHES
+
+
+async def new_session_matches(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        matches = parse_matches(update.message.text)
+    except ParseError as e:
+        await reply(update, f"⚠️ {escape(str(e))}\n\nRimanda l'elenco completo.")
+        return ASK_MATCHES
+    ctx.user_data["new"]["matches"] = matches
+    tz = cfg(ctx).tz
+    await reply(update, f"Ok, {len(matches)} partite.\n\n3/3 – A che ora inizia la sessione?\n"
+                        f"Esempi: <code>25/11/2026 15:30</code>, <code>domani 15:30</code>, <code>15:30</code>\n"
+                        f"(fuso orario {tz.key}; i sondaggi si chiudono {cfg(ctx).close_minutes_before} "
+                        f"minuti prima)")
+    return ASK_START
+
+
+async def new_session_time(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    c = cfg(ctx)
+    try:
+        start = parse_start(update.message.text, c.tz)
+    except ParseError as e:
+        await reply(update, f"⚠️ {escape(str(e))}")
+        return ASK_START
+    data = ctx.user_data["new"]
+    data["start"] = start.isoformat()
+    lines = "\n".join(f"{i}. {escape(p1)} - {escape(p2)}" for i, (p1, p2) in enumerate(data["matches"], 1))
+    warn = ""
+    if start - timedelta(minutes=c.close_minutes_before) <= datetime.now(c.tz):
+        warn = "\n\n⚠️ Attenzione: l'orario di chiusura dei sondaggi è già passato."
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Salva", callback_data="new:save"),
+                                InlineKeyboardButton("❌ Annulla", callback_data="new:cancel")]])
+    await reply(update, f"<b>{escape(data['name'])}</b>\nInizio: {fmt_dt(start, c.tz)}\n"
+                        f"Chiusura sondaggi: {fmt_dt(start - timedelta(minutes=c.close_minutes_before), c.tz)}\n\n"
+                        f"{lines}{warn}\n\nSalvo?", reply_markup=kb)
+    return ASK_CONFIRM
+
+
+async def new_session_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    data = ctx.user_data.pop("new", None)
+    if q.data != "new:save" or not data:
+        await q.edit_message_text("Creazione annullata.")
+        return ConversationHandler.END
+    start = datetime.fromisoformat(data["start"])
+    sid = await db(ctx).create_session(data["name"], start, update.effective_user.id, data["matches"])
+    await q.edit_message_text(
+        f"✅ Sessione salvata.\n\nID sessione: <b>{sid}</b>\n\n"
+        f"Nel gruppo lancia: <code>/lancia_sondaggi {sid}</code>", parse_mode=ParseMode.HTML)
+    return ConversationHandler.END
+
+
+async def new_session_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    ctx.user_data.pop("new", None)
+    await reply(update, "Creazione annullata.")
+    return ConversationHandler.END
+
+
+async def cmd_sessions(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update, ctx):
+        return
+    c = cfg(ctx)
+    sessions = await db(ctx).list_sessions(15)
+    if not sessions:
+        await reply(update, "Nessuna sessione. Creane una con /crea_sessione")
+        return
+    out = []
+    for s in sessions:
+        matches = await db(ctx).get_matches(s.id)
+        done = sum(m.winner is not None for m in matches)
+        state = ("🔒 chiusa" if s.closed_at else "🟢 sondaggi aperti") if s.launched_at else "📝 da lanciare"
+        out.append(f"<b>#{s.id}</b> {escape(s.name)} – {fmt_dt(s.starts_at, c.tz)}\n"
+                   f"    {state} · risultati {done}/{len(matches)}")
+    await reply(update, "\n".join(out))
+
+
+async def cmd_delete_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update, ctx) or update.effective_chat.type != ChatType.PRIVATE:
+        return
+    sid = parse_session_arg(ctx)
+    s = await db(ctx).get_session(sid) if sid else None
+    if not s:
+        await reply(update, "Uso: /elimina_sessione <i>id</i> (vedi /sessioni)")
+        return
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🗑 Sì, elimina", callback_data=f"del:{sid}"),
+                                InlineKeyboardButton("No", callback_data="del:no")]])
+    await reply(update, f"Eliminare la sessione <b>#{sid} {escape(s.name)}</b> con tutti i voti?", reply_markup=kb)
+
+
+async def cb_delete_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    if not is_admin(update, ctx):
+        return
+    arg = q.data.split(":", 1)[1]
+    if arg == "no":
+        await q.edit_message_text("Ok, non elimino nulla.")
+        return
+    ok = await db(ctx).delete_session(int(arg))
+    await q.edit_message_text(f"Sessione #{arg} eliminata." if ok else "Sessione non trovata.")
+
+
+# ---------------------------------------------------------------- mute / smute
+
+async def mute_group(bot, chat_id: int) -> tuple[str | None, str | None]:
+    """Muta il gruppo. Ritorna (permessi precedenti in JSON, errore)."""
+    try:
+        chat = await bot.get_chat(chat_id)
+        prev = chat.permissions.to_json() if chat.permissions else None
+        await bot.set_chat_permissions(chat_id, ChatPermissions.no_permissions())
+        return prev, None
+    except TelegramError as e:
+        return None, str(e)
+
+
+async def unmute_group(bot, chat_id: int, saved_json: str | None) -> str | None:
+    try:
+        if saved_json:
+            perms = ChatPermissions.de_json(json.loads(saved_json), bot)
+        else:
+            perms = ChatPermissions(can_send_messages=True, can_send_audios=True, can_send_documents=True,
+                                    can_send_photos=True, can_send_videos=True, can_send_video_notes=True,
+                                    can_send_voice_notes=True, can_send_polls=True,
+                                    can_send_other_messages=True, can_add_web_page_previews=True)
+        await bot.set_chat_permissions(chat_id, perms)
+        return None
+    except TelegramError as e:
+        return str(e)
+
+
+async def cmd_mute(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat.type == ChatType.PRIVATE or not is_admin(update, ctx):
+        return
+    _, err = await mute_group(ctx.bot, update.effective_chat.id)
+    await reply(update, f"⚠️ Non riesco a mutare il gruppo: {escape(err)}" if err else "🔇 Gruppo mutato.")
+
+
+async def cmd_unmute(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat.type == ChatType.PRIVATE or not is_admin(update, ctx):
+        return
+    saved = await db(ctx).last_saved_permissions(update.effective_chat.id)
+    err = await unmute_group(ctx.bot, update.effective_chat.id, saved)
+    await reply(update, f"⚠️ Non riesco a smutare il gruppo: {escape(err)}" if err else "🔊 Gruppo riaperto.")
+
+
+# ---------------------------------------------------------------- step 2: /lancia_sondaggi
+
+async def cmd_launch(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    if chat.type == ChatType.PRIVATE:
+        await reply(update, "Questo comando va lanciato nel gruppo.")
+        return
+    if not is_admin(update, ctx):
+        return
+    c, d = cfg(ctx), db(ctx)
+    sid = parse_session_arg(ctx)
+    s = await d.get_session(sid) if sid else None
+    if not s:
+        await reply(update, "Uso: /lancia_sondaggi <i>id_sessione</i>")
+        return
+    force = len(ctx.args) > 1 and ctx.args[1].lower() == "forza"
+    if s.launched_at and not force:
+        await reply(update, f"La sessione #{sid} è già stata lanciata. "
+                            f"Per rilanciarla comunque: <code>/lancia_sondaggi {sid} forza</code>")
+        return
+    closes = close_time(s, c)
+    seconds_left = (closes - now_utc()).total_seconds()
+    if seconds_left < 15:
+        await reply(update, f"I sondaggi di questa sessione si sarebbero dovuti chiudere alle "
+                            f"{fmt_dt(closes, c.tz)}: troppo tardi per lanciarli.")
+        return
+    matches = await d.get_matches(sid)
+
+    # Il comando stesso sparisce (serve il permesso di cancellare, altrimenti pazienza).
+    try:
+        await update.effective_message.delete()
+    except TelegramError:
+        pass
+
+    prev_perms, mute_err = await mute_group(ctx.bot, chat.id)
+    if prev_perms:
+        await d.save_permissions(sid, prev_perms)
+    await d.mark_launched(sid, chat.id)
+
+    lines = [f"Inizio: {fmt_dt(s.starts_at, c.tz)}",
+             f"Voti aperti fino alle {closes.astimezone(c.tz):%H:%M}",
+             f"{len(matches)} partite · chi vince?"]
+    caption = (f"🎯 <b>{escape(c.cover_title)}</b> – {escape(s.name)}\n\n"
+               f"Vota il vincitore di ogni partita qui sotto: ogni pronostico giusto vale <b>+1 punto</b>.\n"
+               f"I sondaggi si chiudono alle <b>{closes.astimezone(c.tz):%H:%M}</b>.\n"
+               f"Classifica: /ranking_sessione {sid} · /ranking")
+    try:
+        await ctx.bot.send_photo(chat.id, images.cover_image(c.cover_title, s.name, lines),
+                                 caption=caption, parse_mode=ParseMode.HTML)
+    except TelegramError as e:
+        log.warning("copertina non inviata: %s", e)
+        await ctx.bot.send_message(chat.id, caption, parse_mode=ParseMode.HTML)
+
+    failed = []
+    for m in matches:
+        kw = {}
+        # Telegram accetta close_date solo tra 5 e 600 secondi nel futuro: oltre ci pensa il job.
+        secs = (closes - now_utc()).total_seconds()
+        if 5 <= secs <= 600:
+            kw["close_date"] = closes
+        try:
+            msg = await ctx.bot.send_poll(
+                chat.id,
+                question=f"🎯 Partita {m.position}/{len(matches)}: {m.player1} vs {m.player2} – chi vince?",
+                options=[m.player1, m.player2],
+                is_anonymous=False,           # indispensabile per sapere CHI ha votato
+                allows_multiple_answers=False,
+                **kw,
+            )
+            await d.set_poll(m.id, msg.poll.id, msg.message_id)
+        except TelegramError as e:
+            log.exception("send_poll fallito")
+            failed.append(f"#{m.position} {m.label()}: {e}")
+
+    if c.mute_mode != "chiusura" and prev_perms is not None:
+        err = await unmute_group(ctx.bot, chat.id, prev_perms)
+        if err:
+            mute_err = f"smute fallito: {err}"
+
+    # Report privato all'admin che ha lanciato
+    report = [f"✅ Sessione #{sid} lanciata: {len(matches) - len(failed)}/{len(matches)} sondaggi pubblicati.",
+              f"Chiusura automatica alle {fmt_dt(closes, c.tz)}."]
+    if mute_err:
+        report.append(f"⚠️ Mute: {mute_err}\n(Il bot deve essere admin con il permesso 'Limitare utenti'.)")
+    if failed:
+        report.append("⚠️ Errori:\n" + "\n".join(failed))
+    try:
+        await ctx.bot.send_message(update.effective_user.id, "\n".join(report))
+    except (Forbidden, BadRequest):  # admin anonimo o chat privata mai aperta col bot
+        if failed or mute_err:
+            await ctx.bot.send_message(chat.id, "\n".join(report))
+
+
+# ---------------------------------------------------------------- voti
+
+async def on_poll_answer(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    pa = update.poll_answer
+    user = pa.user
+    if user is None:  # voto "come canale/gruppo" (voter_chat): non associabile a una persona
+        return
+    choice = pa.option_ids[0] + 1 if pa.option_ids else None
+    await register_user(ctx, user)
+    status, chat_id = await db(ctx).record_vote(pa.poll_id, user.id, choice, now_utc())
+    if chat_id is not None:
+        await register_user(ctx, user, chat_id)
+    log.info("voto %s user=%s choice=%s -> %s", pa.poll_id, user.id, choice, status)
+
+
+async def close_due_polls(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Job ricorrente: chiude i sondaggi delle sessioni il cui orario di chiusura è passato."""
+    c, d = cfg(ctx), db(ctx)
+    for s in await d.sessions_to_close(now_utc()):
+        for m in await d.get_matches(s.id):
+            if m.poll_message_id:
+                try:
+                    await ctx.bot.stop_poll(s.chat_id, m.poll_message_id)
+                except BadRequest as e:  # già chiuso (es. via close_date) o messaggio cancellato
+                    log.info("stop_poll %s: %s", m.id, e)
+                except TelegramError:
+                    log.exception("stop_poll fallito")
+        await d.mark_closed(s.id)
+        if c.mute_mode == "chiusura":
+            await unmute_group(ctx.bot, s.chat_id, await d.get_saved_permissions(s.id))
+        n = await d.total_votes(s.id)
+        try:
+            await ctx.bot.send_message(
+                s.chat_id, f"🔒 Sondaggi di <b>{escape(s.name)}</b> chiusi. Voti registrati: {n}.\n"
+                           f"Buon divertimento! 🎯", parse_mode=ParseMode.HTML)
+        except TelegramError:
+            log.exception("messaggio di chiusura fallito")
+
+
+# ---------------------------------------------------------------- step 3: /risultati_sessione
+
+def _result_keyboard(m: Match, mode: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"🏆 {m.player1}", callback_data=f"r:{mode}:{m.id}:1")],
+        [InlineKeyboardButton(f"🏆 {m.player2}", callback_data=f"r:{mode}:{m.id}:2")],
+        [InlineKeyboardButton("🚫 Non disputata", callback_data=f"r:{mode}:{m.id}:0"),
+         InlineKeyboardButton("⏸ Sessione non conclusa", callback_data=f"r:{mode}:{m.id}:stop")],
+    ])
+
+
+def _winner_text(m: Match) -> str:
+    return {None: "—", 0: "non disputata", 1: m.player1, 2: m.player2}[m.winner]
+
+
+async def _ask_next(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, session_id: int, mode: str,
+                    after_position: int) -> None:
+    d = db(ctx)
+    matches = await d.get_matches(session_id)
+    if mode == "a":
+        nxt = next((m for m in matches if m.position > after_position), None)
+    else:
+        nxt = next((m for m in matches if m.winner is None), None)
+    if nxt is None:
+        missing = [m for m in matches if m.winner is None]
+        if missing:
+            await ctx.bot.send_message(chat_id, f"Mancano ancora {len(missing)} risultati: "
+                                                f"/risultati_sessione {session_id}")
+            return
+        s = await d.get_session(session_id)
+        summary = "\n".join(f"{m.position}. {escape(m.label())} → <b>{escape(_winner_text(m))}</b>" for m in matches)
+        kb = None
+        if s and s.chat_id:
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("📣 Pubblica classifica nel gruppo",
+                                                             callback_data=f"pub:{session_id}")]])
+        await ctx.bot.send_message(
+            chat_id, f"🎯 Fatto! Tutte le {len(matches)} partite della sessione #{session_id} "
+                     f"hanno un risultato.\n\n{summary}", parse_mode=ParseMode.HTML, reply_markup=kb)
+        return
+    cur = "" if nxt.winner is None else f"\n(attuale: {escape(_winner_text(nxt))})"
+    await ctx.bot.send_message(
+        chat_id, f"Partita {nxt.position}/{len(matches)}\n<b>{escape(nxt.label())}</b>\n\nChi ha vinto?{cur}",
+        parse_mode=ParseMode.HTML, reply_markup=_result_keyboard(nxt, mode))
+
+
+async def cmd_results(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update, ctx):
+        return
+    if update.effective_chat.type != ChatType.PRIVATE:
+        await reply(update, "Inserisci i risultati in privato con il bot.")
+        return
+    sid = parse_session_arg(ctx)
+    s = await db(ctx).get_session(sid) if sid else None
+    if not s:
+        await reply(update, "Uso: /risultati_sessione <i>id</i> [tutte]\nVedi /sessioni")
+        return
+    mode = "a" if len(ctx.args) > 1 and ctx.args[1].lower() in ("tutte", "tutti", "all") else "m"
+    matches = await db(ctx).get_matches(sid)
+    done = sum(m.winner is not None for m in matches)
+    note = ""
+    if close_time(s, cfg(ctx)) > now_utc():
+        note = "\n⚠️ I sondaggi di questa sessione sono ancora aperti."
+    await reply(update, f"📋 <b>{escape(s.name)}</b> – risultati inseriti {done}/{len(matches)}.{note}")
+    await _ask_next(ctx, update.effective_chat.id, sid, mode, 0)
+
+
+async def cb_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not is_admin(update, ctx):
+        await q.answer("Solo admin", show_alert=True)
+        return
+    _, mode, match_id, value = q.data.split(":")
+    d = db(ctx)
+    m = await d.get_match(int(match_id))
+    if m is None:
+        await q.answer("Partita non trovata")
+        return
+    if value == "stop":
+        await q.answer("Ok, mi fermo qui")
+        await q.edit_message_text(
+            f"⏸ Sessione non conclusa: riprendi quando vuoi con /risultati_sessione {m.session_id}")
+        return
+    await q.answer()
+    await d.set_winner(m.id, int(value))
+    m.winner = int(value)
+    await q.edit_message_text(f"✅ {m.position}. {escape(m.label())} → <b>{escape(_winner_text(m))}</b>",
+                              parse_mode=ParseMode.HTML)
+    await _ask_next(ctx, q.message.chat.id, m.session_id, mode, m.position)
+
+
+async def cb_publish(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not is_admin(update, ctx):
+        await q.answer("Solo admin", show_alert=True)
+        return
+    sid = int(q.data.split(":")[1])
+    s = await db(ctx).get_session(sid)
+    if not s or not s.chat_id:
+        await q.answer("Sessione mai lanciata in un gruppo", show_alert=True)
+        return
+    await q.answer("Pubblico…")
+    await send_ranking(ctx, s.chat_id, session=s)
+    await q.edit_message_reply_markup(None)
+    await ctx.bot.send_message(q.message.chat.id, "📣 Classifica pubblicata nel gruppo.")
+
+
+# ---------------------------------------------------------------- step 4: classifiche
+
+async def send_ranking(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, *, session: Session | None = None,
+                       scope_chat: int | None = None) -> None:
+    c, d = cfg(ctx), db(ctx)
+    if session:
+        rows = await d.ranking(session_id=session.id)
+        done, total = await d.results_progress(session_id=session.id)
+        title, subtitle = "Classifica sessione", f"{session.name} · risultati {done}/{total}"
+    else:
+        rows = await d.ranking(chat_id=scope_chat)
+        done, total = await d.results_progress(chat_id=scope_chat)
+        title, subtitle = "Classifica generale", f"Risultati inseriti {done}/{total}"
+    pos = competition_positions([r.points for r in rows])
+    table = [(p, r.display, r.points, r.answered) for p, r in zip(pos, rows)]
+    footer = f"+1 punto per pronostico giusto · aggiornata {datetime.now(c.tz):%d/%m %H:%M}"
+
+    top = "\n".join(f"{p}. {escape(n)} – {pts}" for p, n, pts, _ in table[:10]) or "Nessun voto ancora."
+    caption = f"🏆 <b>{escape(title)}</b>\n{escape(subtitle)}\n\n{top}"
+    if len(caption) > 1000:
+        caption = caption[:990] + "…"
+    try:
+        pages = images.chunks(table, 30)
+        for i, page in enumerate(pages):
+            t = title if len(pages) == 1 else f"{title} ({i + 1}/{len(pages)})"
+            png = images.ranking_image(t, subtitle, page, footer)
+            await ctx.bot.send_photo(chat_id, png, caption=caption if i == 0 else None, parse_mode=ParseMode.HTML)
+    except TelegramError:
+        log.exception("invio immagine classifica fallito, ripiego sul testo")
+        full = "\n".join(f"{p}. {escape(n)} – {pts}" for p, n, pts, _ in table) or "Nessun voto ancora."
+        await ctx.bot.send_message(chat_id, f"🏆 <b>{escape(title)}</b>\n{escape(subtitle)}\n\n{full}",
+                                   parse_mode=ParseMode.HTML)
+
+
+async def cmd_ranking(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    # Nel gruppo: tutte le sessioni lanciate in quel gruppo. In privato: tutte le sessioni.
+    scope = None if chat.type == ChatType.PRIVATE else chat.id
+    await send_ranking(ctx, chat.id, scope_chat=scope)
+
+
+async def cmd_ranking_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    sid = parse_session_arg(ctx)
+    d = db(ctx)
+    if sid:
+        s = await d.get_session(sid)
+    elif chat.type != ChatType.PRIVATE:
+        s = await d.latest_session_for_chat(chat.id)
+    else:
+        ss = await d.list_sessions(1)
+        s = ss[0] if ss else None
+    if not s:
+        await reply(update, "Sessione non trovata. Uso: /ranking_sessione [<i>id</i>]")
+        return
+    await send_ranking(ctx, chat.id, session=s)
+
+
+# ---------------------------------------------------------------- registro membri
+
+async def on_group_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    if msg is None:
+        return
+    await register_user(ctx, update.effective_user, update.effective_chat.id)
+    for u in msg.new_chat_members or []:
+        await register_user(ctx, u, update.effective_chat.id, "member")
+    if msg.left_chat_member:
+        await register_user(ctx, msg.left_chat_member, update.effective_chat.id, "left")
+
+
+async def on_chat_member(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    cm = update.chat_member
+    status = cm.new_chat_member.status
+    st = "left" if status in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED) else "member"
+    await register_user(ctx, cm.new_chat_member.user, cm.chat.id, st)
+
+
+async def cmd_members(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Quanti utenti del gruppo il bot conosce (e quanti ne dichiara Telegram)."""
+    chat = update.effective_chat
+    if chat.type == ChatType.PRIVATE or not is_admin(update, ctx):
+        return
+    known = await db(ctx).count_members(chat.id)
+    try:
+        total = await ctx.bot.get_chat_member_count(chat.id)
+        # Gli admin si possono leggere tutti: li registriamo subito.
+        for a in await ctx.bot.get_chat_administrators(chat.id):
+            await register_user(ctx, a.user, chat.id, "member")
+        known = await db(ctx).count_members(chat.id)
+    except TelegramError:
+        total = "?"
+    await reply(update, f"👥 Utenti conosciuti dal bot: {known} su {total} membri.\n"
+                        "Gli altri vengono registrati automaticamente appena votano o scrivono.")
+
+
+# ---------------------------------------------------------------- errori
+
+async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    log.error("Errore gestendo un update", exc_info=ctx.error)
+
+
+# ---------------------------------------------------------------- registrazione
+
+def setup(app: Application) -> None:
+    private = filters.ChatType.PRIVATE
+    # Il bottone "Salva" è nell'ultimo messaggio della conversazione: per_message non serve.
+    warnings.filterwarnings("ignore", message="If 'per_message=False'", category=PTBUserWarning)
+    conv = ConversationHandler(
+        entry_points=[CommandHandler("crea_sessione", new_session_start, filters=private)],
+        states={
+            ASK_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, new_session_name)],
+            ASK_MATCHES: [MessageHandler(filters.TEXT & ~filters.COMMAND, new_session_matches)],
+            ASK_START: [MessageHandler(filters.TEXT & ~filters.COMMAND, new_session_time)],
+            ASK_CONFIRM: [CallbackQueryHandler(new_session_confirm, pattern=r"^new:")],
+        },
+        fallbacks=[CommandHandler("annulla", new_session_cancel)],
+        conversation_timeout=timedelta(minutes=30),
+    )
+    app.add_handler(conv)
+    app.add_handler(CommandHandler(["start", "help", "aiuto"], cmd_start))
+    app.add_handler(CommandHandler("mio_id", cmd_my_id))
+    app.add_handler(CommandHandler("sessioni", cmd_sessions))
+    app.add_handler(CommandHandler("elimina_sessione", cmd_delete_session))
+    app.add_handler(CommandHandler("lancia_sondaggi", cmd_launch))
+    app.add_handler(CommandHandler("muta", cmd_mute))
+    app.add_handler(CommandHandler("smuta", cmd_unmute))
+    app.add_handler(CommandHandler("membri", cmd_members))
+    app.add_handler(CommandHandler("risultati_sessione", cmd_results))
+    app.add_handler(CommandHandler("ranking", cmd_ranking))
+    app.add_handler(CommandHandler("ranking_sessione", cmd_ranking_session))
+    app.add_handler(CallbackQueryHandler(cb_result, pattern=r"^r:"))
+    app.add_handler(CallbackQueryHandler(cb_publish, pattern=r"^pub:"))
+    app.add_handler(CallbackQueryHandler(cb_delete_session, pattern=r"^del:"))
+    app.add_handler(PollAnswerHandler(on_poll_answer))
+    app.add_handler(ChatMemberHandler(on_chat_member, ChatMemberHandler.CHAT_MEMBER))
+    # gruppo separato: registra chi scrive anche quando un comando ha già gestito il messaggio
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS, on_group_message), group=1)
+    app.add_error_handler(on_error)
+    app.job_queue.run_repeating(close_due_polls, interval=30, first=5, name="close_due_polls")
+
+
+BOT_COMMANDS_PRIVATE = [
+    ("crea_sessione", "Crea una sessione di sondaggi"),
+    ("sessioni", "Elenco sessioni"),
+    ("risultati_sessione", "Inserisci i risultati: /risultati_sessione id"),
+    ("ranking", "Classifica generale"),
+    ("ranking_sessione", "Classifica di una sessione"),
+    ("annulla", "Annulla la creazione in corso"),
+]
+BOT_COMMANDS_GROUP = [
+    ("ranking", "Classifica generale"),
+    ("ranking_sessione", "Classifica dell'ultima sessione"),
+]
+
+__all__ = ["setup", "BOT_COMMANDS_PRIVATE", "BOT_COMMANDS_GROUP"]

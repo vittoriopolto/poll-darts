@@ -1,0 +1,52 @@
+-- Schema del bot. Viene applicato all'avvio (tutto idempotente).
+
+CREATE TABLE IF NOT EXISTS users (
+    user_id     BIGINT PRIMARY KEY,
+    username    TEXT,
+    first_name  TEXT,
+    last_name   TEXT,
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Chi abbiamo visto in quale gruppo (messaggi, voti, ingressi).
+CREATE TABLE IF NOT EXISTS group_members (
+    chat_id     BIGINT NOT NULL,
+    user_id     BIGINT NOT NULL REFERENCES users(user_id),
+    status      TEXT NOT NULL DEFAULT 'member',
+    last_seen   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (chat_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS sessions (
+    id          SERIAL PRIMARY KEY,
+    name        TEXT NOT NULL,
+    starts_at   TIMESTAMPTZ NOT NULL,
+    created_by  BIGINT NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    chat_id     BIGINT,              -- gruppo in cui sono stati lanciati i sondaggi
+    launched_at TIMESTAMPTZ,
+    closed_at   TIMESTAMPTZ,         -- quando il bot ha chiuso i sondaggi
+    saved_permissions JSONB          -- permessi del gruppo prima del mute, per ripristinarli
+);
+
+CREATE TABLE IF NOT EXISTS matches (
+    id              SERIAL PRIMARY KEY,
+    session_id      INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    position        INTEGER NOT NULL,
+    player1         TEXT NOT NULL,
+    player2         TEXT NOT NULL,
+    poll_id         TEXT UNIQUE,
+    poll_message_id BIGINT,
+    winner          SMALLINT CHECK (winner IN (0, 1, 2)),  -- NULL = da inserire, 0 = non disputata
+    UNIQUE (session_id, position)
+);
+
+CREATE TABLE IF NOT EXISTS votes (
+    match_id    INTEGER NOT NULL REFERENCES matches(id) ON DELETE CASCADE,
+    user_id     BIGINT  NOT NULL REFERENCES users(user_id),
+    choice      SMALLINT NOT NULL CHECK (choice IN (1, 2)),
+    voted_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (match_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS votes_user_idx ON votes(user_id);

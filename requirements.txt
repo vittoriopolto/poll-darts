@@ -1,0 +1,5 @@
+python-telegram-bot[job-queue,rate-limiter]==22.8
+asyncpg==0.32.0
+Pillow==12.0.0
+starlette==0.48.0
+uvicorn==0.37.0

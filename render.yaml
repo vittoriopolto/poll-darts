@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: pdc-poll-bot
+    runtime: python
+    plan: free
+    region: frankfurt
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m pdc
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      - key: BOT_TOKEN
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: WEBHOOK_SECRET
+        generateValue: true
+      - key: TIMEZONE
+        value: Europe/Rome
+      - key: CLOSE_MINUTES_BEFORE
+        value: "5"
+      - key: COVER_TITLE
+        value: PDC180 POLL
+      - key: MUTE_MODE
+        value: invio
