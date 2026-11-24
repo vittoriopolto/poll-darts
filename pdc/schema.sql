@@ -17,6 +17,15 @@ CREATE TABLE IF NOT EXISTS group_members (
     PRIMARY KEY (chat_id, user_id)
 );
 
+-- Un evento raggruppa più sessioni (es. "Open di Natale 2026").
+CREATE TABLE IF NOT EXISTS events (
+    id          SERIAL PRIMARY KEY,
+    name        TEXT NOT NULL,
+    created_by  BIGINT NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    ended_at    TIMESTAMPTZ              -- NULL = evento in corso
+);
+
 CREATE TABLE IF NOT EXISTS sessions (
     id          SERIAL PRIMARY KEY,
     name        TEXT NOT NULL,
@@ -50,3 +59,7 @@ CREATE TABLE IF NOT EXISTS votes (
 );
 
 CREATE INDEX IF NOT EXISTS votes_user_idx ON votes(user_id);
+
+-- Aggiunto dopo la prima versione: ogni sessione può appartenere a un evento.
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS event_id INTEGER REFERENCES events(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS sessions_event_idx ON sessions(event_id);

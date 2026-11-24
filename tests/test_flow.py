@@ -99,13 +99,21 @@ def vote(poll_id, user_id, option_ids):
 async def scenario():
     import asyncpg
     con = await asyncpg.connect(DSN)
-    await con.execute("DROP TABLE IF EXISTS votes, matches, sessions, group_members, users CASCADE")
+    await con.execute("DROP TABLE IF EXISTS votes, matches, sessions, events, group_members, users CASCADE")
     await con.close()
 
     cfg = Config(bot_token="1:x", database_url=DSN, admin_ids=frozenset({ADMIN}), tz=TZ, public_url=None,
                  port=0, webhook_secret="s", close_minutes_before=5, cover_title="PDC180 POLL", mute_mode="invio")
     database = await DB.connect(DSN, 5)
     bot = FakeBot()
+
+    # --- step 0: /start_event
+    upd, rep = make_update()
+    await h.cmd_start_event(upd, make_ctx(bot, cfg, database, ["Open", "di", "Natale"]))
+    assert "ID evento: <b>1</b>" in rep[0]
+    upd, rep = make_update()
+    await h.cmd_start_event(upd, make_ctx(bot, cfg, database, ["Altro"]))
+    assert "già un evento in corso" in rep[0]
 
     # --- step 1: /crea_sessione
     ctx = make_ctx(bot, cfg, database)
@@ -121,6 +129,7 @@ async def scenario():
     upd, edits = make_cb("new:save")
     await h.new_session_confirm(upd, ctx)
     assert "ID sessione: <b>1</b>" in edits[0]
+    assert (await database.get_session(1)).event_id == 1
 
     # non admin non può creare
     upd, rep = make_update(user_id=999, chat_id=999)
@@ -202,6 +211,28 @@ async def scenario():
     bot.calls.clear()
     await h.close_due_polls(make_ctx(bot, cfg, database))
     assert bot.calls == []  # non richiude due volte
+
+    # --- eventi: classifica evento, chiusura, sessione fuori evento
+    assert {r.display: r.points for r in await database.ranking(event_id=1)} == pts
+    bot.calls.clear()
+    upd, rep = make_update(chat_id=GROUP, chat_type="supergroup")
+    await h.cmd_ranking_event(upd, make_ctx(bot, cfg, database, ["open", "di", "natale"]))
+    assert "Classifica evento" in bot.calls[0][2]["caption"] and "in corso" in bot.calls[0][2]["caption"]
+    upd, rep = make_update()
+    await h.cmd_end_event(upd, make_ctx(bot, cfg, database, []))
+    assert "chiuso" in rep[0]
+    upd, rep = make_update()
+    await h.cmd_end_event(upd, make_ctx(bot, cfg, database, ["1"]))
+    assert "già chiuso" in rep[0]
+    sid2 = await database.create_session("Extra", start, ADMIN, [("A", "B")], None)
+    assert (await database.get_session(sid2)).event_id is None
+    assert await database.results_progress(event_id=1) == (3, 3)
+    upd, rep = make_update()
+    await h.cmd_session_event(upd, make_ctx(bot, cfg, database, [str(sid2), "Open di Natale"]))
+    assert (await database.get_session(sid2)).event_id == 1
+    upd, rep = make_update()
+    await h.cmd_events(upd, make_ctx(bot, cfg, database, []))
+    assert "2 sessioni" in rep[0]
 
     await database.close()
 

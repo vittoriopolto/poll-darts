@@ -27,6 +27,15 @@ class Match:
 
 
 @dataclass
+class Event:
+    id: int
+    name: str
+    created_by: int
+    created_at: datetime
+    ended_at: datetime | None
+
+
+@dataclass
 class Session:
     id: int
     name: str
@@ -35,6 +44,7 @@ class Session:
     chat_id: int | None
     launched_at: datetime | None
     closed_at: datetime | None
+    event_id: int | None = None
 
 
 @dataclass
@@ -101,14 +111,59 @@ class DB:
         return await self.pool.fetchval(
             "SELECT count(*) FROM group_members WHERE chat_id = $1 AND status NOT IN ('left', 'kicked')", chat_id)
 
+    # ---------- eventi ----------
+
+    _EV = "SELECT id, name, created_by, created_at, ended_at FROM events"
+
+    async def create_event(self, name: str, created_by: int) -> int:
+        return await self.pool.fetchval(
+            "INSERT INTO events (name, created_by) VALUES ($1, $2) RETURNING id", name, created_by)
+
+    async def active_event(self) -> Event | None:
+        row = await self.pool.fetchrow(self._EV + " WHERE ended_at IS NULL ORDER BY id DESC LIMIT 1")
+        return Event(**dict(row)) if row else None
+
+    async def find_event(self, ref: str) -> Event | None:
+        """Cerca per ID (anche '#3') o per nome (senza maiuscole; se ce ne sono più, il più recente)."""
+        r = ref.strip()
+        if r.lstrip("#").isdigit():
+            row = await self.pool.fetchrow(self._EV + " WHERE id = $1", int(r.lstrip("#")))
+            if row:
+                return Event(**dict(row))
+        row = await self.pool.fetchrow(self._EV + " WHERE lower(name) = lower($1) ORDER BY id DESC LIMIT 1", r)
+        return Event(**dict(row)) if row else None
+
+    async def latest_event(self) -> Event | None:
+        """L'evento in corso, altrimenti l'ultimo chiuso."""
+        row = await self.pool.fetchrow(self._EV + " ORDER BY (ended_at IS NULL) DESC, id DESC LIMIT 1")
+        return Event(**dict(row)) if row else None
+
+    async def end_event(self, event_id: int) -> None:
+        await self.pool.execute("UPDATE events SET ended_at = now() WHERE id = $1 AND ended_at IS NULL", event_id)
+
+    async def list_events(self, limit: int = 10) -> list[tuple[Event, int]]:
+        rows = await self.pool.fetch(
+            "SELECT e.id, e.name, e.created_by, e.created_at, e.ended_at, count(s.id) AS n "
+            "FROM events e LEFT JOIN sessions s ON s.event_id = e.id GROUP BY e.id ORDER BY e.id DESC LIMIT $1",
+            limit)
+        return [(Event(**{k: r[k] for k in ("id", "name", "created_by", "created_at", "ended_at")}), r["n"])
+                for r in rows]
+
+    async def get_event(self, event_id: int) -> Event | None:
+        row = await self.pool.fetchrow(self._EV + " WHERE id = $1", event_id)
+        return Event(**dict(row)) if row else None
+
+    async def set_session_event(self, session_id: int, event_id: int | None) -> None:
+        await self.pool.execute("UPDATE sessions SET event_id = $2 WHERE id = $1", session_id, event_id)
+
     # ---------- sessioni ----------
 
     async def create_session(self, name: str, starts_at: datetime, created_by: int,
-                             matches: list[tuple[str, str]]) -> int:
+                             matches: list[tuple[str, str]], event_id: int | None = None) -> int:
         async with self.pool.acquire() as con, con.transaction():
             sid = await con.fetchval(
-                "INSERT INTO sessions (name, starts_at, created_by) VALUES ($1, $2, $3) RETURNING id",
-                name, starts_at, created_by,
+                "INSERT INTO sessions (name, starts_at, created_by, event_id) VALUES ($1, $2, $3, $4) RETURNING id",
+                name, starts_at, created_by, event_id,
             )
             await con.executemany(
                 "INSERT INTO matches (session_id, position, player1, player2) VALUES ($1, $2, $3, $4)",
@@ -118,19 +173,19 @@ class DB:
 
     async def get_session(self, session_id: int) -> Session | None:
         row = await self.pool.fetchrow(
-            "SELECT id, name, starts_at, created_by, chat_id, launched_at, closed_at FROM sessions WHERE id = $1",
+            "SELECT id, name, starts_at, created_by, chat_id, launched_at, closed_at, event_id FROM sessions WHERE id = $1",
             session_id)
         return Session(**dict(row)) if row else None
 
     async def list_sessions(self, limit: int = 10) -> list[Session]:
         rows = await self.pool.fetch(
-            "SELECT id, name, starts_at, created_by, chat_id, launched_at, closed_at "
+            "SELECT id, name, starts_at, created_by, chat_id, launched_at, closed_at, event_id "
             "FROM sessions ORDER BY id DESC LIMIT $1", limit)
         return [Session(**dict(r)) for r in rows]
 
     async def latest_session_for_chat(self, chat_id: int) -> Session | None:
         row = await self.pool.fetchrow(
-            "SELECT id, name, starts_at, created_by, chat_id, launched_at, closed_at FROM sessions "
+            "SELECT id, name, starts_at, created_by, chat_id, launched_at, closed_at, event_id FROM sessions "
             "WHERE chat_id = $1 ORDER BY launched_at DESC NULLS LAST, id DESC LIMIT 1", chat_id)
         return Session(**dict(row)) if row else None
 
@@ -160,7 +215,7 @@ class DB:
     async def sessions_to_close(self, now: datetime) -> list[Session]:
         """Sessioni lanciate, con sondaggi ancora aperti e orario di chiusura già passato."""
         rows = await self.pool.fetch(
-            "SELECT id, name, starts_at, created_by, chat_id, launched_at, closed_at FROM sessions "
+            "SELECT id, name, starts_at, created_by, chat_id, launched_at, closed_at, event_id FROM sessions "
             "WHERE launched_at IS NOT NULL AND closed_at IS NULL AND starts_at - $2::interval <= $1",
             now, self.close_delta)
         return [Session(**dict(r)) for r in rows]
@@ -225,11 +280,12 @@ class DB:
 
     # ---------- classifica ----------
 
-    async def ranking(self, *, session_id: int | None = None, chat_id: int | None = None) -> list[RankRow]:
+    async def ranking(self, *, session_id: int | None = None, chat_id: int | None = None,
+                      event_id: int | None = None) -> list[RankRow]:
         """Classifica: +1 per ogni voto uguale al vincitore.
 
-        session_id -> solo quella sessione; chat_id -> tutte le sessioni lanciate in quel gruppo;
-        nessuno dei due -> tutte le sessioni.
+        session_id -> solo quella sessione; event_id -> le sessioni di quell'evento;
+        chat_id -> tutte le sessioni lanciate in quel gruppo; nessuno -> tutte le sessioni.
         """
         rows = await self.pool.fetch(
             """SELECT u.user_id, u.username, u.first_name, u.last_name,
@@ -240,18 +296,21 @@ class DB:
                JOIN sessions s ON s.id = m.session_id
                JOIN users u    ON u.user_id = v.user_id
                WHERE ($1::int IS NULL OR s.id = $1) AND ($2::bigint IS NULL OR s.chat_id = $2)
+                 AND ($3::int IS NULL OR s.event_id = $3)
                GROUP BY u.user_id
                ORDER BY points DESC, lower(COALESCE(u.username, u.first_name, ''))""",
-            session_id, chat_id)
+            session_id, chat_id, event_id)
         return [RankRow(r["user_id"], display_name(r["username"], r["first_name"], r["last_name"]),
                         r["points"], r["answered"]) for r in rows]
 
-    async def results_progress(self, *, session_id: int | None = None, chat_id: int | None = None) -> tuple[int, int]:
+    async def results_progress(self, *, session_id: int | None = None, chat_id: int | None = None,
+                               event_id: int | None = None) -> tuple[int, int]:
         """(partite con risultato, partite totali) nel perimetro della classifica."""
         row = await self.pool.fetchrow(
             """SELECT count(*) FILTER (WHERE m.winner IS NOT NULL) AS done, count(*) AS total
                FROM matches m JOIN sessions s ON s.id = m.session_id
                WHERE ($1::int IS NULL OR s.id = $1) AND ($2::bigint IS NULL OR s.chat_id = $2)
+                 AND ($3::int IS NULL OR s.event_id = $3)
                  AND s.launched_at IS NOT NULL""",
-            session_id, chat_id)
+            session_id, chat_id, event_id)
         return row["done"], row["total"]

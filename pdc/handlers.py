@@ -17,7 +17,7 @@ from telegram.warnings import PTBUserWarning
 
 from . import images
 from .config import Config
-from .db import DB, Match, Session
+from .db import DB, Event, Match, Session
 from .parsing import ParseError, competition_positions, fmt_dt, parse_matches, parse_start
 
 log = logging.getLogger(__name__)
@@ -85,6 +85,11 @@ async def register_user(ctx: ContextTypes.DEFAULT_TYPE, user, chat_id: int | Non
 # ---------------------------------------------------------------- comandi base
 
 HELP_ADMIN = (
+    "<b>Eventi (admin)</b>\n"
+    "/start_event <i>nome</i> – apre un evento: le sessioni create da ora finiscono lì\n"
+    "/end_event [<i>id o nome</i>] – chiude l'evento (default: quello in corso)\n"
+    "/eventi – elenco eventi\n"
+    "/sessione_evento <i>id_sessione</i> <i>id_evento</i>|nessuno – sposta una sessione\n\n"
     "<b>Comandi admin (in privato)</b>\n"
     "/crea_sessione – crea una sessione (nome, partite, orario)\n"
     "/sessioni – elenco delle ultime sessioni\n"
@@ -97,7 +102,8 @@ HELP_ADMIN = (
 )
 HELP_ALL = (
     "<b>Comandi per tutti</b>\n"
-    "/ranking – classifica generale\n"
+    "/ranking – classifica globale\n"
+    "/ranking_evento [<i>id o nome</i>] – classifica di un evento (default: quello in corso o l'ultimo)\n"
     "/ranking_sessione [<i>id</i>] – classifica di una sessione (default: l'ultima)\n"
     "/mio_id – mostra il tuo ID Telegram"
 )
@@ -166,9 +172,13 @@ async def new_session_time(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> in
     warn = ""
     if start - timedelta(minutes=c.close_minutes_before) <= datetime.now(c.tz):
         warn = "\n\n⚠️ Attenzione: l'orario di chiusura dei sondaggi è già passato."
+    ev = await db(ctx).active_event()
+    data["event_id"] = ev.id if ev else None
+    ev_line = (f"Evento: <b>#{ev.id} {escape(ev.name)}</b>\n" if ev
+               else "Evento: nessuno (apri un evento con /start_event)\n")
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Salva", callback_data="new:save"),
                                 InlineKeyboardButton("❌ Annulla", callback_data="new:cancel")]])
-    await reply(update, f"<b>{escape(data['name'])}</b>\nInizio: {fmt_dt(start, c.tz)}\n"
+    await reply(update, f"<b>{escape(data['name'])}</b>\n{ev_line}Inizio: {fmt_dt(start, c.tz)}\n"
                         f"Chiusura sondaggi: {fmt_dt(start - timedelta(minutes=c.close_minutes_before), c.tz)}\n\n"
                         f"{lines}{warn}\n\nSalvo?", reply_markup=kb)
     return ASK_CONFIRM
@@ -182,7 +192,8 @@ async def new_session_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
         await q.edit_message_text("Creazione annullata.")
         return ConversationHandler.END
     start = datetime.fromisoformat(data["start"])
-    sid = await db(ctx).create_session(data["name"], start, update.effective_user.id, data["matches"])
+    sid = await db(ctx).create_session(data["name"], start, update.effective_user.id, data["matches"],
+                                       data.get("event_id"))
     await q.edit_message_text(
         f"✅ Sessione salvata.\n\nID sessione: <b>{sid}</b>\n\n"
         f"Nel gruppo lancia: <code>/lancia_sondaggi {sid}</code>", parse_mode=ParseMode.HTML)
@@ -208,8 +219,9 @@ async def cmd_sessions(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         matches = await db(ctx).get_matches(s.id)
         done = sum(m.winner is not None for m in matches)
         state = ("🔒 chiusa" if s.closed_at else "🟢 sondaggi aperti") if s.launched_at else "📝 da lanciare"
+        ev = f" · evento #{s.event_id}" if s.event_id else ""
         out.append(f"<b>#{s.id}</b> {escape(s.name)} – {fmt_dt(s.starts_at, c.tz)}\n"
-                   f"    {state} · risultati {done}/{len(matches)}")
+                   f"    {state} · risultati {done}/{len(matches)}{ev}")
     await reply(update, "\n".join(out))
 
 
@@ -321,13 +333,15 @@ async def cmd_launch(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await d.save_permissions(sid, prev_perms)
     await d.mark_launched(sid, chat.id)
 
-    lines = [f"Inizio: {fmt_dt(s.starts_at, c.tz)}",
+    event = await d.get_event(s.event_id) if s.event_id else None
+    lines = ([event.name] if event else []) + [f"Inizio: {fmt_dt(s.starts_at, c.tz)}",
              f"Voti aperti fino alle {closes.astimezone(c.tz):%H:%M}",
              f"{len(matches)} partite · chi vince?"]
     caption = (f"🎯 <b>{escape(c.cover_title)}</b> – {escape(s.name)}\n\n"
                f"Vota il vincitore di ogni partita qui sotto: ogni pronostico giusto vale <b>+1 punto</b>.\n"
                f"I sondaggi si chiudono alle <b>{closes.astimezone(c.tz):%H:%M}</b>.\n"
-               f"Classifica: /ranking_sessione {sid} · /ranking")
+               f"Classifica: /ranking_sessione {sid}"
+               + (f" · /ranking_evento {s.event_id}" if s.event_id else "") + " · /ranking")
     try:
         await ctx.bot.send_photo(chat.id, images.cover_image(c.cover_title, s.name, lines),
                                  caption=caption, parse_mode=ParseMode.HTML)
@@ -523,16 +537,21 @@ async def cb_publish(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 # ---------------------------------------------------------------- step 4: classifiche
 
 async def send_ranking(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, *, session: Session | None = None,
-                       scope_chat: int | None = None) -> None:
+                       event: Event | None = None, scope_chat: int | None = None) -> None:
     c, d = cfg(ctx), db(ctx)
-    if session:
+    if event:
+        rows = await d.ranking(event_id=event.id)
+        done, total = await d.results_progress(event_id=event.id)
+        state = "in corso" if event.ended_at is None else "concluso"
+        title, subtitle = "Classifica evento", f"{event.name} ({state}) · risultati {done}/{total}"
+    elif session:
         rows = await d.ranking(session_id=session.id)
         done, total = await d.results_progress(session_id=session.id)
         title, subtitle = "Classifica sessione", f"{session.name} · risultati {done}/{total}"
     else:
         rows = await d.ranking(chat_id=scope_chat)
         done, total = await d.results_progress(chat_id=scope_chat)
-        title, subtitle = "Classifica generale", f"Risultati inseriti {done}/{total}"
+        title, subtitle = "Classifica globale", f"Tutti gli eventi · risultati {done}/{total}"
     pos = competition_positions([r.points for r in rows])
     table = [(p, r.display, r.points, r.answered) for p, r in zip(pos, rows)]
     footer = f"+1 punto per pronostico giusto · aggiornata {datetime.now(c.tz):%d/%m %H:%M}"
@@ -576,6 +595,97 @@ async def cmd_ranking_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
         await reply(update, "Sessione non trovata. Uso: /ranking_sessione [<i>id</i>]")
         return
     await send_ranking(ctx, chat.id, session=s)
+
+
+async def cmd_ranking_event(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    d = db(ctx)
+    ref = " ".join(ctx.args).strip()
+    ev = await d.find_event(ref) if ref else await d.latest_event()
+    if not ev:
+        await reply(update, "Evento non trovato. Uso: /ranking_evento [<i>id o nome</i>]")
+        return
+    await send_ranking(ctx, update.effective_chat.id, event=ev)
+
+
+# ---------------------------------------------------------------- eventi
+
+async def cmd_start_event(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update, ctx):
+        return
+    d = db(ctx)
+    name = " ".join(ctx.args).strip()
+    if not name or len(name) > 120:
+        await reply(update, "Uso: /start_event <i>nome evento</i> (max 120 caratteri)")
+        return
+    active = await d.active_event()
+    if active:
+        await reply(update, f"C'è già un evento in corso: <b>#{active.id} {escape(active.name)}</b>.\n"
+                            f"Chiudilo prima con <code>/end_event {active.id}</code>")
+        return
+    eid = await d.create_event(name, update.effective_user.id)
+    await reply(update, f"🏁 Evento aperto: <b>{escape(name)}</b>\nID evento: <b>{eid}</b>\n\n"
+                        f"Le sessioni create da ora con /crea_sessione faranno parte di questo evento.\n"
+                        f"Classifica: <code>/ranking_evento {eid}</code> · chiusura: <code>/end_event {eid}</code>")
+
+
+async def cmd_end_event(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update, ctx):
+        return
+    d = db(ctx)
+    ref = " ".join(ctx.args).strip()
+    ev = await d.find_event(ref) if ref else await d.active_event()
+    if not ev:
+        await reply(update, "Evento non trovato. Uso: /end_event [<i>id o nome</i>] (vedi /eventi)")
+        return
+    if ev.ended_at:
+        await reply(update, f"L'evento <b>#{ev.id} {escape(ev.name)}</b> era già chiuso.")
+        return
+    await d.end_event(ev.id)
+    done, total = await d.results_progress(event_id=ev.id)
+    miss = f"\n⚠️ Mancano ancora {total - done} risultati: si possono inserire anche ora." if done < total else ""
+    await reply(update, f"🏁 Evento <b>#{ev.id} {escape(ev.name)}</b> chiuso.\n"
+                        f"Classifica finale: <code>/ranking_evento {ev.id}</code>{miss}")
+
+
+async def cmd_events(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update, ctx):
+        return
+    c = cfg(ctx)
+    events = await db(ctx).list_events(15)
+    if not events:
+        await reply(update, "Nessun evento. Aprine uno con /start_event <i>nome</i>")
+        return
+    out = []
+    for ev, n in events:
+        state = "🟢 in corso" if ev.ended_at is None else f"🏁 chiuso il {ev.ended_at.astimezone(c.tz):%d/%m}"
+        out.append(f"<b>#{ev.id}</b> {escape(ev.name)} – {state} · {n} sessioni")
+    await reply(update, "\n".join(out))
+
+
+async def cmd_session_event(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """/sessione_evento <id_sessione> <id_evento|nessuno>: corregge l'evento di una sessione."""
+    if not is_admin(update, ctx):
+        return
+    d = db(ctx)
+    usage = "Uso: /sessione_evento <i>id_sessione</i> <i>id_evento</i> (oppure <i>nessuno</i>)"
+    if len(ctx.args) < 2 or not ctx.args[0].lstrip("#").isdigit():
+        await reply(update, usage)
+        return
+    s = await d.get_session(int(ctx.args[0].lstrip("#")))
+    if not s:
+        await reply(update, "Sessione non trovata.")
+        return
+    ref = " ".join(ctx.args[1:]).strip()
+    if ref.lower() in ("nessuno", "none", "0", "-"):
+        await d.set_session_event(s.id, None)
+        await reply(update, f"Sessione #{s.id} tolta dall'evento.")
+        return
+    ev = await d.find_event(ref)
+    if not ev:
+        await reply(update, "Evento non trovato. " + usage)
+        return
+    await d.set_session_event(s.id, ev.id)
+    await reply(update, f"Sessione <b>#{s.id} {escape(s.name)}</b> → evento <b>#{ev.id} {escape(ev.name)}</b>.")
 
 
 # ---------------------------------------------------------------- registro membri
@@ -651,6 +761,11 @@ def setup(app: Application) -> None:
     app.add_handler(CommandHandler("risultati_sessione", cmd_results))
     app.add_handler(CommandHandler("ranking", cmd_ranking))
     app.add_handler(CommandHandler("ranking_sessione", cmd_ranking_session))
+    app.add_handler(CommandHandler("ranking_evento", cmd_ranking_event))
+    app.add_handler(CommandHandler("start_event", cmd_start_event))
+    app.add_handler(CommandHandler("end_event", cmd_end_event))
+    app.add_handler(CommandHandler("eventi", cmd_events))
+    app.add_handler(CommandHandler("sessione_evento", cmd_session_event))
     app.add_handler(CallbackQueryHandler(cb_result, pattern=r"^r:"))
     app.add_handler(CallbackQueryHandler(cb_publish, pattern=r"^pub:"))
     app.add_handler(CallbackQueryHandler(cb_delete_session, pattern=r"^del:"))
@@ -663,15 +778,20 @@ def setup(app: Application) -> None:
 
 
 BOT_COMMANDS_PRIVATE = [
+    ("start_event", "Apri un evento: /start_event nome"),
+    ("end_event", "Chiudi l'evento in corso"),
+    ("eventi", "Elenco eventi"),
     ("crea_sessione", "Crea una sessione di sondaggi"),
     ("sessioni", "Elenco sessioni"),
     ("risultati_sessione", "Inserisci i risultati: /risultati_sessione id"),
-    ("ranking", "Classifica generale"),
+    ("ranking", "Classifica globale"),
+    ("ranking_evento", "Classifica di un evento"),
     ("ranking_sessione", "Classifica di una sessione"),
     ("annulla", "Annulla la creazione in corso"),
 ]
 BOT_COMMANDS_GROUP = [
-    ("ranking", "Classifica generale"),
+    ("ranking", "Classifica globale"),
+    ("ranking_evento", "Classifica dell'evento in corso"),
     ("ranking_sessione", "Classifica dell'ultima sessione"),
 ]
 

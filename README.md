@@ -10,12 +10,17 @@ Stack: Python 3.12 · python-telegram-bot 22 · Postgres (Neon) · deploy su Ren
 
 | Dove | Comando | Cosa fa |
 |---|---|---|
+| privato o gruppo (admin) | `/start_event nome` | apre un evento e restituisce l'**ID evento**: tutte le sessioni create da ora ne fanno parte (un evento alla volta) |
+| privato o gruppo (admin) | `/end_event [ID o nome]` | chiude l'evento (senza argomenti: quello in corso). I risultati si possono inserire anche dopo |
+| privato (admin) | `/eventi` | elenco eventi con numero di sessioni |
+| privato (admin) | `/sessione_evento ID_SESSIONE ID_EVENTO` | sposta una sessione in un altro evento (`nessuno` per toglierla) |
 | privato (admin) | `/crea_sessione` | chiede nome, partite (`GIOCATORE 1 - GIOCATORE 2`, una per riga) e orario di inizio; salva e restituisce l'**ID sessione** |
 | gruppo (admin) | `/lancia_sondaggi ID` | muta il gruppo, pubblica la copertina "PDC180 POLL" e un sondaggio per partita, poi riapre il gruppo |
 | — | (automatico) | i sondaggi si chiudono **5 minuti prima** dell'inizio sessione |
 | privato (admin) | `/risultati_sessione ID` | per ogni partita senza risultato: bottoni *Giocatore 1* / *Giocatore 2* / *Non disputata* / *Sessione non conclusa*. Rilanciandolo riprende da dove mancava |
 | privato (admin) | `/risultati_sessione ID tutte` | ripassa tutte le partite per correggere un risultato |
-| gruppo / privato | `/ranking` | classifica generale (nel gruppo: tutte le sessioni lanciate in quel gruppo) |
+| gruppo / privato | `/ranking` | classifica globale (nel gruppo: tutte le sessioni lanciate in quel gruppo) |
+| gruppo / privato | `/ranking_evento [ID o nome]` | classifica di un evento (default: quello in corso, o l'ultimo chiuso) |
 | gruppo / privato | `/ranking_sessione [ID]` | classifica di una sessione (default: l'ultima lanciata nel gruppo) |
 | privato (admin) | `/sessioni`, `/elimina_sessione ID` | elenco e cancellazione |
 | gruppo (admin) | `/muta`, `/smuta`, `/membri` | mute manuale; quanti membri il bot conosce |
@@ -23,6 +28,9 @@ Stack: Python 3.12 · python-telegram-bot 22 · Postgres (Neon) · deploy su Ren
 
 Formati orario accettati: `25/11/2026 15:30`, `25/11 15:30`, `domani 15:30`, `15:30` (fuso `Europe/Rome`).
 Separatori partite accettati: `-`, `–`, `vs`. Numerazione iniziale (`1)`, `1.`) ignorata.
+
+Tre livelli di classifica: **sessione** → **evento** (insieme di sessioni) → **globale** (tutto).
+Il riepilogo di `/crea_sessione` mostra a quale evento verrà assegnata la sessione.
 
 A fine inserimento risultati il bot offre il bottone **📣 Pubblica classifica nel gruppo**.
 
