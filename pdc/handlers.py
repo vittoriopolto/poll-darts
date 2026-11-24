@@ -337,11 +337,11 @@ async def cmd_launch(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     lines = ([event.name] if event else []) + [f"Inizio: {fmt_dt(s.starts_at, c.tz)}",
              f"Voti aperti fino alle {closes.astimezone(c.tz):%H:%M}",
              f"{len(matches)} partite · chi vince?"]
-    caption = (f"🎯 <b>{escape(c.cover_title)}</b> – {escape(s.name)}\n\n"
+    # Niente comandi nel messaggio: nel gruppo la gente ci cliccherebbe sopra.
+    caption = (f"🎯 <b>{escape(c.cover_title)}</b> – {escape(s.name)}"
+               + (f" · {escape(event.name)}" if event else "") + "\n\n"
                f"Vota il vincitore di ogni partita qui sotto: ogni pronostico giusto vale <b>+1 punto</b>.\n"
-               f"I sondaggi si chiudono alle <b>{closes.astimezone(c.tz):%H:%M}</b>.\n"
-               f"Classifica: /ranking_sessione {sid}"
-               + (f" · /ranking_evento {s.event_id}" if s.event_id else "") + " · /ranking")
+               f"I sondaggi si chiudono alle <b>{closes.astimezone(c.tz):%H:%M}</b>.")
     try:
         await ctx.bot.send_photo(chat.id, images.cover_image(c.cover_title, s.name, lines),
                                  caption=caption, parse_mode=ParseMode.HTML)
@@ -359,7 +359,7 @@ async def cmd_launch(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         try:
             msg = await ctx.bot.send_poll(
                 chat.id,
-                question=f"🎯 Partita {m.position}/{len(matches)}: {m.player1} vs {m.player2} – chi vince?",
+                question=f"{m.player1} - {m.player2}",
                 options=[m.player1, m.player2],
                 is_anonymous=False,           # indispensabile per sapere CHI ha votato
                 allows_multiple_answers=False,

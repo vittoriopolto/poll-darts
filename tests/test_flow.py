@@ -145,6 +145,9 @@ async def scenario():
     assert all(p[2]["is_anonymous"] is False for p in polls)
     assert all("close_date" not in p[2] for p in polls)  # chiusura > 10 min: la gestisce il job
     assert polls[0][1][2] == ["Rossi", "Bianchi"]
+    assert polls[0][1][1] == "Rossi - Bianchi"                 # domanda: solo i due nomi
+    photo = next(c for c in bot.calls if c[0] == "photo")
+    assert "/ranking" not in photo[2]["caption"]               # niente comandi cliccabili
 
     # rilancio bloccato
     upd, rep = make_update(chat_id=GROUP, chat_type="supergroup")

@@ -134,7 +134,8 @@ pdc/
   schema.sql    tabelle (create in automatico)
   parsing.py    lettura partite/orari, piazzamenti a pari merito
   images.py     copertina e classifica in PNG (Pillow)
-assets/fonts    DejaVu Sans (licenza libera)
+assets/logo.jpg logo PDC180 (usato nelle immagini)
+assets/fonts    DejaVu Sans e Liberation Sans (licenze libere)
 render.yaml     configurazione Render
 ```
 
