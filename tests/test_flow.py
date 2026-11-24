@@ -201,8 +201,14 @@ async def scenario():
     await h.cmd_ranking_session(upd, make_ctx(bot, cfg, database, []))
     await h.cmd_ranking(upd, make_ctx(bot, cfg, database, []))
     photos = [c for c in bot.calls if c[0] == "photo"]
-    assert len(photos) == 2 and "1. @player1 – 2" in photos[0][2]["caption"]
-    assert "3. @player3 – 1" in photos[0][2]["caption"]
+    assert len(photos) == 2 and "1. @player1 – <b>2</b> (2/3, 67%)" in photos[0][2]["caption"]
+    assert "3. @player3 – <b>1</b> (1/3, 33%)" in photos[0][2]["caption"]
+    # versione solo testo
+    bot.calls.clear()
+    await h.cmd_ranking_session(upd, make_ctx(bot, cfg, database, ["1", "txt"]))
+    await h.cmd_ranking(upd, make_ctx(bot, cfg, database, ["TXT"]))
+    assert [c[0] for c in bot.calls] == ["msg", "msg"]
+    assert "Classifica sessione" in bot.calls[0][1][1] and "(2/3, 67%)" in bot.calls[0][1][1]
 
     # --- chiusura: voti oltre l'orario ignorati, job chiude i sondaggi
     await database.pool.execute("UPDATE sessions SET starts_at = now() + interval '4 minutes'")
@@ -221,6 +227,9 @@ async def scenario():
     upd, rep = make_update(chat_id=GROUP, chat_type="supergroup")
     await h.cmd_ranking_event(upd, make_ctx(bot, cfg, database, ["open", "di", "natale"]))
     assert "Classifica evento" in bot.calls[0][2]["caption"] and "in corso" in bot.calls[0][2]["caption"]
+    bot.calls.clear()
+    await h.cmd_ranking_event(upd, make_ctx(bot, cfg, database, ["open", "di", "natale", "txt"]))
+    assert bot.calls[0][0] == "msg" and "Open di Natale" in bot.calls[0][1][1]
     upd, rep = make_update()
     await h.cmd_end_event(upd, make_ctx(bot, cfg, database, []))
     assert "chiuso" in rep[0]

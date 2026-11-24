@@ -140,5 +140,7 @@ render.yaml     configurazione Render
 ```
 
 Punteggio: +1 per ogni voto uguale al vincitore. Pari merito stile sportivo (1, 1, 3…). Le partite
-"non disputate" non danno punti a nessuno. Nella classifica la colonna "SU" indica su quante
-partite con risultato quell'utente ha votato.
+"non disputate" non danno punti a nessuno. Nella classifica la colonna "SU" indica quanti voti
+l'utente ha dato su partite che hanno già un risultato, e "%" la percentuale di pronostici giusti
+su quei voti (arrotondata). Aggiungendo `txt` ai comandi di classifica (es. `/ranking txt`,
+`/ranking_sessione 3 txt`, `/ranking_evento txt`) arriva solo il testo, senza immagine.

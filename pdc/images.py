@@ -137,8 +137,9 @@ def ranking_image(title: str, subtitle: str, rows: list[tuple[int, str, int, int
     tf = _shrink(d, title, 58, W - 300, _title_font)
     d.text((50, 40), title, font=tf, fill=WHITE)
     d.text((50, 118), _fit(d, subtitle, _font(26), W - 300), font=_font(26), fill=CREAM)
-    d.text((W - 238, head_h - 30), "PUNTI", font=_font(20, True), fill=MUTED)
-    d.text((W - 128, head_h - 30), "SU", font=_font(20, True), fill=MUTED)
+    hf = _font(20, True)
+    for label, cx in (("PUNTI", W - 300), ("SU", W - 195), ("%", W - 95)):
+        d.text((cx - d.textlength(label, font=hf) / 2, head_h - 30), label, font=hf, fill=MUTED)
 
     # podio con i colori del logo: rosso, blu, beige
     podium = {1: RED, 2: BLUE, 3: CREAM}
@@ -157,13 +158,16 @@ def ranking_image(title: str, subtitle: str, rows: list[tuple[int, str, int, int
             d.text((68 - pw / 2, y + 16), ptxt, font=pos_f, fill=BG if col == CREAM else WHITE)
         else:
             d.text((52, y + 16), f"{pos}.", font=pos_f, fill=MUTED)
-        d.text((115, y + 13), _fit(d, name, name_f, W - 400), font=name_f, fill=WHITE)
+        d.text((115, y + 13), _fit(d, name, name_f, W - 490), font=name_f, fill=WHITE)
         ps = str(pts)
         pw = d.textlength(ps, font=pts_f)
-        d.text((W - 205 - pw / 2, y + 10), ps, font=pts_f, fill=col or WHITE)
+        d.text((W - 300 - pw / 2, y + 10), ps, font=pts_f, fill=col or WHITE)
         a = str(answered)
         aw = d.textlength(a, font=sm_f)
-        d.text((W - 113 - aw / 2, y + 17), a, font=sm_f, fill=MUTED)
+        d.text((W - 195 - aw / 2, y + 17), a, font=sm_f, fill=MUTED)
+        pc = f"{(pts * 200 + answered) // (2 * answered)}%" if answered else "–"
+        cw = d.textlength(pc, font=sm_f)
+        d.text((W - 95 - cw / 2, y + 17), pc, font=sm_f, fill=CREAM)
     if footer:
         d.text((50, H - foot_h + 22), _fit(d, footer, _font(22), W - 100), font=_font(22), fill=MUTED)
     return _png(img)

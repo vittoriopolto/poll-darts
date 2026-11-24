@@ -102,7 +102,7 @@ HELP_ADMIN = (
 )
 HELP_ALL = (
     "<b>Comandi per tutti</b>\n"
-    "/ranking – classifica globale\n"
+    "/ranking – classifica globale (aggiungi <i>txt</i> per averla solo come testo)\n"
     "/ranking_evento [<i>id o nome</i>] – classifica di un evento (default: quello in corso o l'ultimo)\n"
     "/ranking_sessione [<i>id</i>] – classifica di una sessione (default: l'ultima)\n"
     "/mio_id – mostra il tuo ID Telegram"
@@ -536,8 +536,26 @@ async def cb_publish(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ---------------------------------------------------------------- step 4: classifiche
 
+def pct(points: int, answered: int) -> int | None:
+    """% di pronostici giusti sui voti dati a partite con risultato (intero arrotondato)."""
+    return (points * 200 + answered) // (2 * answered) if answered else None  # arrotonda 0,5 per eccesso
+
+
+def _rank_line(p: int, name: str, pts: int, answered: int) -> str:
+    pc = pct(pts, answered)
+    return f"{p}. {escape(name)} – <b>{pts}</b> ({pts}/{answered}" + (f", {pc}%)" if pc is not None else ")")
+
+
+def pop_txt_flag(ctx: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Toglie 'txt' dagli argomenti del comando e dice se c'era."""
+    args = list(ctx.args or [])
+    found = any(a.lower() in ("txt", "testo") for a in args)
+    ctx.args = [a for a in args if a.lower() not in ("txt", "testo")]
+    return found
+
+
 async def send_ranking(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, *, session: Session | None = None,
-                       event: Event | None = None, scope_chat: int | None = None) -> None:
+                       event: Event | None = None, scope_chat: int | None = None, text_only: bool = False) -> None:
     c, d = cfg(ctx), db(ctx)
     if event:
         rows = await d.ranking(event_id=event.id)
@@ -554,12 +572,26 @@ async def send_ranking(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, *, session:
         title, subtitle = "Classifica globale", f"Tutti gli eventi · risultati {done}/{total}"
     pos = competition_positions([r.points for r in rows])
     table = [(p, r.display, r.points, r.answered) for p, r in zip(pos, rows)]
-    footer = f"+1 punto per pronostico giusto · aggiornata {datetime.now(c.tz):%d/%m %H:%M}"
+    footer = f"SU = voti dati su partite concluse · aggiornata {datetime.now(c.tz):%d/%m %H:%M}"
+    head = f"🏆 <b>{escape(title)}</b>\n{escape(subtitle)}\n\n"
 
-    top = "\n".join(f"{p}. {escape(n)} – {pts}" for p, n, pts, _ in table[:10]) or "Nessun voto ancora."
-    caption = f"🏆 <b>{escape(title)}</b>\n{escape(subtitle)}\n\n{top}"
+    async def send_text() -> None:
+        lines = [_rank_line(*row) for row in table] or ["Nessun voto ancora."]
+        chunk = head
+        for line in lines:  # i messaggi Telegram hanno un limite di 4096 caratteri
+            if len(chunk) + len(line) > 3900:
+                await ctx.bot.send_message(chat_id, chunk, parse_mode=ParseMode.HTML)
+                chunk = ""
+            chunk += line + "\n"
+        await ctx.bot.send_message(chat_id, chunk, parse_mode=ParseMode.HTML)
+
+    if text_only:
+        await send_text()
+        return
+    top = "\n".join(_rank_line(*row) for row in table[:10]) or "Nessun voto ancora."
+    caption = head + top
     if len(caption) > 1000:
-        caption = caption[:990] + "…"
+        caption = head + "\n".join(_rank_line(*row) for row in table[:5])
     try:
         pages = images.chunks(table, 30)
         for i, page in enumerate(pages):
@@ -568,20 +600,19 @@ async def send_ranking(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, *, session:
             await ctx.bot.send_photo(chat_id, png, caption=caption if i == 0 else None, parse_mode=ParseMode.HTML)
     except TelegramError:
         log.exception("invio immagine classifica fallito, ripiego sul testo")
-        full = "\n".join(f"{p}. {escape(n)} – {pts}" for p, n, pts, _ in table) or "Nessun voto ancora."
-        await ctx.bot.send_message(chat_id, f"🏆 <b>{escape(title)}</b>\n{escape(subtitle)}\n\n{full}",
-                                   parse_mode=ParseMode.HTML)
+        await send_text()
 
 
 async def cmd_ranking(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
     # Nel gruppo: tutte le sessioni lanciate in quel gruppo. In privato: tutte le sessioni.
     scope = None if chat.type == ChatType.PRIVATE else chat.id
-    await send_ranking(ctx, chat.id, scope_chat=scope)
+    await send_ranking(ctx, chat.id, scope_chat=scope, text_only=pop_txt_flag(ctx))
 
 
 async def cmd_ranking_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
+    text_only = pop_txt_flag(ctx)
     sid = parse_session_arg(ctx)
     d = db(ctx)
     if sid:
@@ -594,17 +625,18 @@ async def cmd_ranking_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
     if not s:
         await reply(update, "Sessione non trovata. Uso: /ranking_sessione [<i>id</i>]")
         return
-    await send_ranking(ctx, chat.id, session=s)
+    await send_ranking(ctx, chat.id, session=s, text_only=text_only)
 
 
 async def cmd_ranking_event(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     d = db(ctx)
+    text_only = pop_txt_flag(ctx)
     ref = " ".join(ctx.args).strip()
     ev = await d.find_event(ref) if ref else await d.latest_event()
     if not ev:
         await reply(update, "Evento non trovato. Uso: /ranking_evento [<i>id o nome</i>]")
         return
-    await send_ranking(ctx, update.effective_chat.id, event=ev)
+    await send_ranking(ctx, update.effective_chat.id, event=ev, text_only=text_only)
 
 
 # ---------------------------------------------------------------- eventi
