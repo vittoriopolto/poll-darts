@@ -48,6 +48,22 @@ class Session:
 
 
 @dataclass
+class FbOption:
+    id: int
+    position: int
+    text: str
+
+
+@dataclass
+class FbQuestion:
+    id: int
+    pool_id: int
+    position: int
+    text: str
+    options: list[FbOption]
+
+
+@dataclass
 class RankRow:
     user_id: int
     display: str
@@ -358,3 +374,91 @@ class DB:
                  AND s.launched_at IS NOT NULL""",
             session_id, chat_id, event_id)
         return row["done"], row["total"]
+
+    # ---------- feedback ----------
+
+    async def create_feedback(self, created_by: int, questions: list[tuple[str, list[str]]]) -> int:
+        """Salva un pool di feedback: questions = [(testo domanda, [risposte])]. Ritorna l'ID."""
+        async with self.pool.acquire() as con, con.transaction():
+            pid = await con.fetchval("INSERT INTO feedback_pools (created_by) VALUES ($1) RETURNING id", created_by)
+            for qpos, (text, options) in enumerate(questions, 1):
+                qid = await con.fetchval(
+                    "INSERT INTO feedback_questions (pool_id, position, text) VALUES ($1, $2, $3) RETURNING id",
+                    pid, qpos, text)
+                await con.executemany(
+                    "INSERT INTO feedback_options (question_id, position, text) VALUES ($1, $2, $3)",
+                    [(qid, opos, o) for opos, o in enumerate(options, 1)])
+            return pid
+
+    async def feedback_exists(self, pool_id: int) -> bool:
+        return bool(await self.pool.fetchval("SELECT 1 FROM feedback_pools WHERE id = $1", pool_id))
+
+    async def latest_feedback(self) -> int | None:
+        return await self.pool.fetchval("SELECT max(id) FROM feedback_pools")
+
+    async def list_feedbacks(self, limit: int = 15) -> list[tuple[int, int, int, datetime]]:
+        """(id, n. domande, n. persone che hanno risposto, creato il), dal più recente."""
+        rows = await self.pool.fetch(
+            """SELECT p.id, p.created_at,
+                      (SELECT count(*) FROM feedback_questions q WHERE q.pool_id = p.id) AS nq,
+                      (SELECT count(DISTINCT a.user_id) FROM feedback_answers a
+                         JOIN feedback_questions q ON q.id = a.question_id WHERE q.pool_id = p.id) AS nu
+               FROM feedback_pools p ORDER BY p.id DESC LIMIT $1""", limit)
+        return [(r["id"], r["nq"], r["nu"], r["created_at"]) for r in rows]
+
+    async def feedback_questions(self, pool_id: int) -> list[FbQuestion]:
+        rows = await self.pool.fetch(
+            """SELECT q.id, q.position, q.text, o.id AS oid, o.position AS opos, o.text AS otext
+               FROM feedback_questions q JOIN feedback_options o ON o.question_id = q.id
+               WHERE q.pool_id = $1 ORDER BY q.position, o.position""", pool_id)
+        out: dict[int, FbQuestion] = {}
+        for r in rows:
+            q = out.setdefault(r["id"], FbQuestion(r["id"], pool_id, r["position"], r["text"], []))
+            q.options.append(FbOption(r["oid"], r["opos"], r["otext"]))
+        return list(out.values())
+
+    async def feedback_option(self, option_id: int) -> tuple[int, int] | None:
+        """(question_id, pool_id) di una risposta."""
+        row = await self.pool.fetchrow(
+            "SELECT q.id, q.pool_id FROM feedback_options o JOIN feedback_questions q ON q.id = o.question_id "
+            "WHERE o.id = $1", option_id)
+        return (row["id"], row["pool_id"]) if row else None
+
+    async def save_feedback_answer(self, question_id: int, user_id: int, option_id: int) -> None:
+        await self.pool.execute(
+            """INSERT INTO feedback_answers (question_id, user_id, option_id) VALUES ($1, $2, $3)
+               ON CONFLICT (question_id, user_id) DO UPDATE
+               SET option_id = EXCLUDED.option_id, answered_at = now()""",
+            question_id, user_id, option_id)
+
+    async def feedback_answered(self, pool_id: int, user_id: int) -> set[int]:
+        """ID delle domande del pool a cui l'utente ha già risposto."""
+        rows = await self.pool.fetch(
+            "SELECT a.question_id FROM feedback_answers a JOIN feedback_questions q ON q.id = a.question_id "
+            "WHERE q.pool_id = $1 AND a.user_id = $2", pool_id, user_id)
+        return {r["question_id"] for r in rows}
+
+    async def feedback_counts(self, pool_id: int) -> dict[int, int]:
+        """Voti per ogni risposta (option_id -> n), comprese quelle a zero."""
+        rows = await self.pool.fetch(
+            """SELECT o.id, count(a.user_id) AS n
+               FROM feedback_options o JOIN feedback_questions q ON q.id = o.question_id
+               LEFT JOIN feedback_answers a ON a.option_id = o.id
+               WHERE q.pool_id = $1 GROUP BY o.id""", pool_id)
+        return {r["id"]: r["n"] for r in rows}
+
+    async def feedback_respondents(self, pool_id: int) -> int:
+        return await self.pool.fetchval(
+            "SELECT count(DISTINCT a.user_id) FROM feedback_answers a "
+            "JOIN feedback_questions q ON q.id = a.question_id WHERE q.pool_id = $1", pool_id)
+
+    async def feedback_voters(self, question_id: int) -> dict[int, list[str]]:
+        """option_id -> nomi di chi l'ha scelta (in ordine di risposta)."""
+        rows = await self.pool.fetch(
+            """SELECT a.option_id, u.username, u.first_name, u.last_name
+               FROM feedback_answers a JOIN users u ON u.user_id = a.user_id
+               WHERE a.question_id = $1 ORDER BY a.answered_at""", question_id)
+        out: dict[int, list[str]] = {}
+        for r in rows:
+            out.setdefault(r["option_id"], []).append(display_name(r["username"], r["first_name"], r["last_name"]))
+        return out

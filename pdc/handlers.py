@@ -98,6 +98,11 @@ HELP_ADMIN = (
     "/delete_event <i>id o nome</i> – elimina un evento (con o senza le sue sessioni)\n"
     "/delete_session <i>id</i> – elimina una sessione con partite e voti\n"
     "/delete_match <i>id_sessione</i> [<i>n° partita</i>] – elimina una partita e i suoi voti\n\n"
+    "<b>Feedback (admin)</b>\n"
+    "/crea_feedback – crea un feedback: domande e risposte, una alla volta\n"
+    "/risultati_feedback [<i>id</i>] – percentuali per domanda (senza id: elenco)\n"
+    "/risultati_feedback <i>id</i> <i>n° domanda</i> – chi ha votato cosa\n"
+    "/consigli [<i>id</i>] – nel gruppo: invito con il bottone per rispondere (default: l'ultimo)\n\n"
     "<b>Comandi admin (nel gruppo)</b>\n"
     "/lancia_sondaggi <i>id</i> – muta il gruppo, pubblica copertina e sondaggi\n"
     "/muta, /smuta – muta/smuta il gruppo a mano\n\n"
@@ -113,6 +118,17 @@ HELP_ALL = (
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await register_user(ctx, update.effective_user)
+    # Deep link dai bottoni: /start fb_ID (rispondi al feedback), /start fbd_ID_N (dettaglio, admin).
+    arg = ctx.args[0] if ctx.args else ""
+    if update.effective_chat.type == ChatType.PRIVATE and arg.startswith("fb"):
+        kind, _, rest = arg.partition("_")
+        nums = rest.split("_")
+        if kind == "fb" and rest.isdigit():
+            await start_feedback(update, ctx, int(rest))
+            return
+        if kind == "fbd" and len(nums) == 2 and all(n.isdigit() for n in nums) and is_admin(update, ctx):
+            await send_feedback_detail(update, ctx, int(nums[0]), int(nums[1]))
+            return
     text = "🎯 <b>Bot sondaggi freccette</b>\n\n" + (HELP_ADMIN if is_admin(update, ctx) else "") + HELP_ALL
     await reply(update, text)
 
@@ -852,6 +868,294 @@ async def cmd_session_event(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     await reply(update, f"Sessione <b>#{s.id} {escape(s.name)}</b> → evento <b>#{ev.id} {escape(ev.name)}</b>.")
 
 
+# ---------------------------------------------------------------- feedback (/crea_feedback, /consigli)
+
+FB_QUESTION, FB_OPTION, FB_MORE = range(10, 13)
+FB_STOP_WORDS = {"stop", "stop feedback", "fine", "basta"}
+
+
+def _fb_stop_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Stop feedback", callback_data="fbw:stop")]])
+
+
+def _fb_more_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("➕ Aggiungi risposta", callback_data="fbw:add"),
+                                  InlineKeyboardButton("✅ Fine domanda", callback_data="fbw:endq")]])
+
+
+async def fb_new_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    if not is_admin(update, ctx):
+        await reply(update, "Solo gli admin possono creare feedback.")
+        return ConversationHandler.END
+    ctx.user_data["fb"] = {"questions": [], "current": None}
+    await reply(update, "📝 <b>Nuovo feedback</b>\n\nScrivi il testo della <b>domanda 1</b>.\n\n"
+                        "/annulla per uscire senza salvare.", reply_markup=_fb_stop_kb())
+    return FB_QUESTION
+
+
+async def fb_new_question(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    if text.lower() in FB_STOP_WORDS:
+        return await _fb_finish(update, ctx, edit=None)
+    if not text or len(text) > 300:
+        await reply(update, "Domanda non valida (max 300 caratteri). Riprova.", reply_markup=_fb_stop_kb())
+        return FB_QUESTION
+    data = ctx.user_data["fb"]
+    data["current"] = {"text": text, "options": []}
+    await reply(update, f"Domanda {len(data['questions']) + 1}: <b>{escape(text)}</b>\n\n"
+                        f"Scrivi la <b>prima risposta</b>.")
+    return FB_OPTION
+
+
+async def fb_new_option(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    cur = ctx.user_data["fb"]["current"]
+    # una risposta diventa il testo di un bottone: Telegram ne taglia la lunghezza, teniamola corta
+    if not text or len(text) > 60:
+        await reply(update, "Risposta non valida (max 60 caratteri). Riprova.")
+        return FB_OPTION
+    if len(cur["options"]) >= 10:
+        await reply(update, "Massimo 10 risposte per domanda: premi <b>Fine domanda</b>.", reply_markup=_fb_more_kb())
+        return FB_MORE
+    cur["options"].append(text)
+    lines = "\n".join(f"{i}. {escape(o)}" for i, o in enumerate(cur["options"], 1))
+    await reply(update, f"<b>{escape(cur['text'])}</b>\n{lines}", reply_markup=_fb_more_kb())
+    return FB_MORE
+
+
+async def fb_new_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    data = ctx.user_data.get("fb")
+    if not data:
+        await q.answer()
+        await q.edit_message_reply_markup(None)
+        return ConversationHandler.END
+    action = q.data.split(":")[1]
+    if action == "stop":
+        await q.answer()
+        return await _fb_finish(update, ctx, edit=q.edit_message_text)
+    cur = data["current"]
+    if action == "add":
+        await q.answer()
+        await q.edit_message_reply_markup(None)
+        await ctx.bot.send_message(update.effective_chat.id, f"Scrivi la risposta {len(cur['options']) + 1}.")
+        return FB_OPTION
+    # fine domanda
+    if len(cur["options"]) < 2:
+        await q.answer("Servono almeno 2 risposte.", show_alert=True)
+        return FB_MORE
+    await q.answer()
+    await q.edit_message_reply_markup(None)
+    data["questions"].append(cur)
+    data["current"] = None
+    n = len(data["questions"]) + 1
+    await ctx.bot.send_message(update.effective_chat.id,
+                               f"✅ Domanda {n - 1} salvata.\n\nScrivi il testo della <b>domanda {n}</b>, "
+                               f"oppure premi <b>Stop feedback</b> per finire.",
+                               parse_mode=ParseMode.HTML, reply_markup=_fb_stop_kb())
+    return FB_QUESTION
+
+
+async def _fb_finish(update: Update, ctx: ContextTypes.DEFAULT_TYPE, edit) -> int:
+    data = ctx.user_data.pop("fb", None) or {"questions": []}
+    questions = data["questions"]
+    if not questions:
+        text = "Feedback annullato: nessuna domanda inserita."
+    else:
+        pid = await db(ctx).create_feedback(update.effective_user.id,
+                                            [(qq["text"], qq["options"]) for qq in questions])
+        lines = "\n".join(f"{i}. {escape(qq['text'])} ({len(qq['options'])} risposte)"
+                          for i, qq in enumerate(questions, 1))
+        text = (f"✅ Feedback salvato.\n\nID feedback: <b>{pid}</b>\n\n{lines}\n\n"
+                f"Nel gruppo lancia: <code>/consigli {pid}</code>\n"
+                f"Risultati: <code>/risultati_feedback {pid}</code>")
+    if edit:
+        await edit(text, parse_mode=ParseMode.HTML)
+    else:
+        await reply(update, text)
+    return ConversationHandler.END
+
+
+async def fb_new_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    ctx.user_data.pop("fb", None)
+    await reply(update, "Creazione feedback annullata.")
+    return ConversationHandler.END
+
+
+def _deep_link(ctx: ContextTypes.DEFAULT_TYPE, payload: str) -> str:
+    return f"https://t.me/{ctx.bot.username}?start={payload}"
+
+
+async def cmd_consigli(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """/consigli [ID]: nel gruppo pubblica l'invito con il bottone che apre le domande in privato."""
+    chat = update.effective_chat
+    if chat.type == ChatType.PRIVATE:
+        await reply(update, "Questo comando va lanciato nel gruppo: <code>/consigli ID</code>")
+        return
+    if not is_admin(update, ctx):
+        return
+    d = db(ctx)
+    pid = parse_session_arg(ctx)
+    if pid is None and not ctx.args:
+        pid = await d.latest_feedback()
+    if not pid or not await d.feedback_exists(pid):
+        await reply(update, "Uso: /consigli <i>id_feedback</i> (crealo in privato con /crea_feedback)")
+        return
+    try:
+        await update.effective_message.delete()
+    except TelegramError:
+        pass
+    caption = ("💬 <b>Dammi qualche feedback sul poll game!</b>\n\n"
+               "Rispondi qui sotto 👇 Le domande arrivano in privato, bastano pochi click.")
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🎯 Dai qualche consiglio sui sondaggi",
+                                                     url=_deep_link(ctx, f"fb_{pid}"))]])
+    try:
+        await ctx.bot.send_photo(chat.id, images.feedback_image(cfg(ctx).cover_title), caption=caption,
+                                 parse_mode=ParseMode.HTML, reply_markup=kb)
+    except TelegramError as e:
+        log.warning("immagine feedback non inviata: %s", e)
+        await ctx.bot.send_message(chat.id, caption, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+async def _fb_send_next(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int, pool_id: int,
+                        after: int = 0, redo: bool = False) -> None:
+    """Manda la prossima domanda: in modalità redo quella dopo la posizione `after`,
+    altrimenti la prima a cui l'utente non ha ancora risposto."""
+    d = db(ctx)
+    questions = await d.feedback_questions(pool_id)
+    if redo:
+        nxt = next((q for q in questions if q.position > after), None)
+    else:
+        done = await d.feedback_answered(pool_id, user_id)
+        nxt = next((q for q in questions if q.id not in done), None)
+    if nxt is None:
+        await ctx.bot.send_message(chat_id, "🙏 Grazie! Le tue risposte sono state salvate.")
+        return
+    mode = "r" if redo else "n"
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton(o.text, callback_data=f"fba:{o.id}:{mode}")]
+                               for o in nxt.options])
+    await ctx.bot.send_message(chat_id, f"Domanda {nxt.position}/{len(questions)}\n\n<b>{escape(nxt.text)}</b>",
+                               parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+async def start_feedback(update: Update, ctx: ContextTypes.DEFAULT_TYPE, pool_id: int) -> None:
+    """Arrivo dal bottone nel gruppo (/start fb_ID): parte il questionario in privato."""
+    d = db(ctx)
+    user = update.effective_user
+    if not await d.feedback_exists(pool_id):
+        await reply(update, "Questo feedback non esiste più.")
+        return
+    questions = await d.feedback_questions(pool_id)
+    done = await d.feedback_answered(pool_id, user.id)
+    if questions and all(q.id in done for q in questions):
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔁 Cambia le risposte", callback_data=f"fbr:{pool_id}")]])
+        await reply(update, "Hai già risposto a tutte le domande, grazie! 🎯", reply_markup=kb)
+        return
+    n = len(questions)
+    await reply(update, f"🎯 Grazie per il tuo aiuto! {'È una domanda' if n == 1 else f'Sono {n} domande'}: "
+                        f"rispondi con i bottoni.")
+    await _fb_send_next(ctx, update.effective_chat.id, user.id, pool_id)
+
+
+async def cb_feedback_answer(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    _, oid, mode = q.data.split(":")
+    d = db(ctx)
+    found = await d.feedback_option(int(oid))
+    if not found:
+        await q.answer("Questo feedback non esiste più.", show_alert=True)
+        return
+    qid, pool_id = found
+    await q.answer()
+    user = update.effective_user
+    await register_user(ctx, user)
+    await d.save_feedback_answer(qid, user.id, int(oid))
+    questions = await d.feedback_questions(pool_id)
+    this = next(x for x in questions if x.id == qid)
+    chosen = next(o.text for o in this.options if o.id == int(oid))
+    try:
+        await q.edit_message_text(f"Domanda {this.position}/{len(questions)}\n\n<b>{escape(this.text)}</b>\n"
+                                  f"✅ {escape(chosen)}", parse_mode=ParseMode.HTML)
+    except BadRequest:  # stesso testo (doppio click): niente da cambiare
+        pass
+    await _fb_send_next(ctx, update.effective_chat.id, user.id, pool_id, after=this.position, redo=mode == "r")
+
+
+async def cb_feedback_redo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    pool_id = int(q.data.split(":")[1])
+    await q.edit_message_reply_markup(None)
+    if not await db(ctx).feedback_exists(pool_id):
+        await ctx.bot.send_message(update.effective_chat.id, "Questo feedback non esiste più.")
+        return
+    await _fb_send_next(ctx, update.effective_chat.id, update.effective_user.id, pool_id, redo=True)
+
+
+def _votes(n: int) -> str:
+    return f"{n} voto" if n == 1 else f"{n} voti"
+
+
+async def cmd_feedback_results(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """/risultati_feedback [ID] [N]: senza ID elenco, con ID percentuali, con N chi ha votato cosa."""
+    if not _private_admin(update, ctx):
+        return
+    d = db(ctx)
+    args = [a.lstrip("#") for a in ctx.args]
+    if not args:
+        pools = await d.list_feedbacks()
+        if not pools:
+            await reply(update, "Nessun feedback. Creane uno con /crea_feedback")
+            return
+        lines = [f"<b>#{pid}</b> – {nq} domande · {nu} persone hanno risposto · "
+                 f"{created.astimezone(cfg(ctx).tz):%d/%m/%Y}" for pid, nq, nu, created in pools]
+        await reply(update, "📋 <b>Feedback</b>\n\n" + "\n".join(lines)
+                    + "\n\nDettaglio: <code>/risultati_feedback ID</code>")
+        return
+    if not all(a.isdigit() for a in args[:2]):
+        await reply(update, "Uso: /risultati_feedback <i>id</i> [<i>numero domanda</i>]")
+        return
+    pid = int(args[0])
+    if len(args) > 1:
+        await send_feedback_detail(update, ctx, pid, int(args[1]))
+        return
+    if not await d.feedback_exists(pid):
+        await reply(update, f"Il feedback #{pid} non esiste.")
+        return
+    questions = await d.feedback_questions(pid)
+    counts = await d.feedback_counts(pid)
+    people = await d.feedback_respondents(pid)
+    out = [f"📊 <b>Feedback #{pid}</b> – {people} {'persona ha' if people == 1 else 'persone hanno'} risposto"]
+    for q in questions:
+        tot = sum(counts.get(o.id, 0) for o in q.options)
+        link = f'<a href="{_deep_link(ctx, f"fbd_{pid}_{q.position}")}">🔎 dettaglio</a>'
+        out.append(f"\n<b>{q.position}. {escape(q.text)}</b>  {link}")
+        for o in q.options:
+            n = counts.get(o.id, 0)
+            p = round(n * 100 / tot) if tot else 0
+            out.append(f"<code>{p:>3}%</code> · {_votes(n)} – {escape(o.text)}")
+    await reply(update, "\n".join(out))
+
+
+async def send_feedback_detail(update: Update, ctx: ContextTypes.DEFAULT_TYPE, pool_id: int, pos: int) -> None:
+    d = db(ctx)
+    questions = await d.feedback_questions(pool_id)
+    q = next((x for x in questions if x.position == pos), None)
+    if q is None:
+        await reply(update, f"Il feedback #{pool_id} non ha una domanda {pos}." if questions
+                    else f"Il feedback #{pool_id} non esiste.")
+        return
+    voters = await d.feedback_voters(q.id)
+    tot = sum(len(v) for v in voters.values())
+    out = [f"🔎 <b>Feedback #{pool_id} – domanda {q.position}</b>\n<b>{escape(q.text)}</b>"]
+    for o in q.options:
+        names = voters.get(o.id, [])
+        p = round(len(names) * 100 / tot) if tot else 0
+        out.append(f"\n<b>{escape(o.text)}</b> – {p}% · {_votes(len(names))}\n"
+                   + (escape(", ".join(names)) if names else "–"))
+    await reply(update, "\n".join(out))
+
+
 # ---------------------------------------------------------------- registro membri
 
 async def on_group_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -914,6 +1218,24 @@ def setup(app: Application) -> None:
         conversation_timeout=timedelta(minutes=30),
     )
     app.add_handler(conv)
+    fb_conv = ConversationHandler(
+        entry_points=[CommandHandler("crea_feedback", fb_new_start, filters=private)],
+        states={
+            FB_QUESTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, fb_new_question),
+                          CallbackQueryHandler(fb_new_button, pattern=r"^fbw:stop")],
+            FB_OPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, fb_new_option)],
+            # se invece di premere un bottone scrive un'altra risposta, la aggiungiamo
+            FB_MORE: [MessageHandler(filters.TEXT & ~filters.COMMAND, fb_new_option),
+                      CallbackQueryHandler(fb_new_button, pattern=r"^fbw:(add|endq)")],
+        },
+        fallbacks=[CommandHandler("annulla", fb_new_cancel)],
+        conversation_timeout=timedelta(minutes=30),
+    )
+    app.add_handler(fb_conv)
+    app.add_handler(CommandHandler("consigli", cmd_consigli))
+    app.add_handler(CommandHandler("risultati_feedback", cmd_feedback_results))
+    app.add_handler(CallbackQueryHandler(cb_feedback_answer, pattern=r"^fba:"))
+    app.add_handler(CallbackQueryHandler(cb_feedback_redo, pattern=r"^fbr:"))
     app.add_handler(CommandHandler(["start", "help", "aiuto"], cmd_start))
     app.add_handler(CommandHandler("mio_id", cmd_my_id))
     app.add_handler(CommandHandler("sessioni", cmd_sessions))
@@ -953,6 +1275,8 @@ BOT_COMMANDS_PRIVATE = [
     ("ranking", "Classifica globale"),
     ("ranking_evento", "Classifica di un evento"),
     ("ranking_sessione", "Classifica di una sessione"),
+    ("crea_feedback", "Crea un feedback (domande e risposte)"),
+    ("risultati_feedback", "Risultati feedback: /risultati_feedback id [n]"),
     ("annulla", "Annulla la creazione in corso"),
 ]
 BOT_COMMANDS_GROUP = [

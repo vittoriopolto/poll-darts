@@ -24,6 +24,8 @@ TZ = ZoneInfo("Europe/Rome")
 
 
 class FakeBot:
+    username = "pdc_test_bot"
+
     def __init__(self):
         self.calls = []
         self.ids = itertools.count(1000)
@@ -49,6 +51,7 @@ class FakeBot:
 
     async def send_message(self, chat_id, text, **kw):
         self._log("msg", chat_id, text, **kw)
+        return NS(message_id=next(self.ids))
 
     async def stop_poll(self, chat_id, message_id, **kw):
         self._log("stop", chat_id, message_id)
@@ -58,11 +61,13 @@ def make_ctx(bot, cfg, database, args=()):
     return NS(application=NS(bot_data={"cfg": cfg, "db": database}), bot=bot, args=list(args), user_data={})
 
 
-def make_update(user_id=ADMIN, chat_id=ADMIN, chat_type="private", text=""):
+def make_update(user_id=ADMIN, chat_id=ADMIN, chat_type="private", text="", markups=None):
     replies = []
 
     async def reply_text(t, **kw):
         replies.append(t)
+        if markups is not None:
+            markups.append(kw.get("reply_markup"))
 
     async def delete():
         pass
@@ -73,7 +78,7 @@ def make_update(user_id=ADMIN, chat_id=ADMIN, chat_type="private", text=""):
               message=msg, callback_query=None, poll_answer=None), replies
 
 
-def make_cb(data, chat_id=ADMIN):
+def make_cb(data, chat_id=ADMIN, user_id=ADMIN):
     edits = []
 
     async def answer(*a, **kw):
@@ -85,7 +90,7 @@ def make_cb(data, chat_id=ADMIN):
     async def edit_message_reply_markup(*a, **kw):
         pass
 
-    upd, _ = make_update()
+    upd, _ = make_update(user_id=user_id, chat_id=chat_id)
     upd.callback_query = NS(data=data, answer=answer, edit_message_text=edit_message_text,
                             edit_message_reply_markup=edit_message_reply_markup, message=NS(chat=NS(id=chat_id)))
     return upd, edits
@@ -99,7 +104,7 @@ def vote(poll_id, user_id, option_ids):
 async def scenario():
     import asyncpg
     con = await asyncpg.connect(DSN)
-    await con.execute("DROP TABLE IF EXISTS votes, matches, sessions, events, group_members, users CASCADE")
+    await con.execute("DROP TABLE IF EXISTS feedback_answers, feedback_options, feedback_questions, feedback_pools, votes, matches, sessions, events, group_members, users CASCADE")
     await con.close()
 
     cfg = Config(bot_token="1:x", database_url=DSN, admin_ids=frozenset({ADMIN}), tz=TZ, public_url=None,
@@ -279,7 +284,114 @@ async def scenario():
     await h.cmd_delete_session(upd, make_ctx(bot, cfg, database, [str(sid2)]))
     assert rep == [] and await database.get_session(sid2) is not None
 
+    await feedback_scenario(bot, cfg, database)
     await database.close()
+
+
+def buttons(markup):
+    return [b for row in markup.inline_keyboard for b in row]
+
+
+async def feedback_scenario(bot, cfg, database):
+    U1, U2 = 501, 502
+    ctx = make_ctx(bot, cfg, database)
+
+    async def say(text, state_fn):
+        upd, rep = make_update(text=text)
+        return await state_fn(upd, ctx), rep
+
+    # --- /crea_feedback: domanda 1 con 3 risposte, domanda 2 con 2, poi stop
+    upd, rep = make_update()
+    assert await h.fb_new_start(upd, ctx) == h.FB_QUESTION and "domanda 1" in rep[0]
+    st, rep = await say("Ti piace il gioco?", h.fb_new_question)
+    assert st == h.FB_OPTION
+    st, rep = await say("Sì", h.fb_new_option)
+    assert st == h.FB_MORE
+    # fine domanda con una sola risposta: rifiutato
+    upd, _ = make_cb("fbw:endq")
+    assert await h.fb_new_button(upd, ctx) == h.FB_MORE
+    upd, _ = make_cb("fbw:add")
+    assert await h.fb_new_button(upd, ctx) == h.FB_OPTION
+    await say("No", h.fb_new_option)
+    await say("Così così", h.fb_new_option)  # scritta senza premere "aggiungi"
+    upd, _ = make_cb("fbw:endq")
+    assert await h.fb_new_button(upd, ctx) == h.FB_QUESTION
+    await say("Orario sondaggi?", h.fb_new_question)
+    await say("Va bene", h.fb_new_option)
+    await say("Prima", h.fb_new_option)
+    await h.fb_new_button(make_cb("fbw:endq")[0], ctx)
+    upd, edits = make_cb("fbw:stop")
+    assert await h.fb_new_button(upd, ctx) == h.ConversationHandler.END
+    assert "ID feedback: <b>1</b>" in edits[0]
+    qs = await database.feedback_questions(1)
+    assert [(q.text, [o.text for o in q.options]) for q in qs] == [
+        ("Ti piace il gioco?", ["Sì", "No", "Così così"]), ("Orario sondaggi?", ["Va bene", "Prima"])]
+
+    # --- /consigli nel gruppo (senza ID = l'ultimo): immagine + bottone con deep link
+    bot.calls.clear()
+    upd, rep = make_update(chat_id=GROUP, chat_type="supergroup")
+    await h.cmd_consigli(upd, make_ctx(bot, cfg, database, []))
+    name, a, kw = bot.calls[0]
+    assert name == "photo" and "Rispondi qui sotto" in kw["caption"]
+    btn = buttons(kw["reply_markup"])[0]
+    assert btn.url == "https://t.me/pdc_test_bot?start=fb_1"
+    # non admin: niente
+    bot.calls.clear()
+    upd, rep = make_update(user_id=U1, chat_id=GROUP, chat_type="supergroup")
+    await h.cmd_consigli(upd, make_ctx(bot, cfg, database, ["1"]))
+    assert bot.calls == []
+
+    # --- U1 clicca: /start fb_1 in privato, risponde alle 2 domande
+    async def answer(user, qtext, opt):
+        msg = next(c for c in reversed(bot.calls) if c[0] == "msg" and c[1][0] == user)
+        assert qtext in msg[1][1], msg
+        b = next(b for b in buttons(msg[2]["reply_markup"]) if b.text == opt)
+        await h.cb_feedback_answer(make_cb(b.callback_data, chat_id=user, user_id=user)[0], ctx)
+
+    bot.calls.clear()
+    upd, rep = make_update(user_id=U1, chat_id=U1)
+    await h.cmd_start(upd, make_ctx(bot, cfg, database, ["fb_1"]))
+    assert "Sono 2 domande" in rep[0]
+    await answer(U1, "Ti piace il gioco?", "Sì")
+    await answer(U1, "Domanda 2/2", "Prima")
+    assert "Grazie" in bot.calls[-1][1][1]
+    # U2 risponde solo alla prima, poi riprende dalla seconda
+    upd, rep = make_update(user_id=U2, chat_id=U2)
+    await h.cmd_start(upd, make_ctx(bot, cfg, database, ["fb_1"]))
+    await answer(U2, "Ti piace il gioco?", "No")
+    upd, rep = make_update(user_id=U2, chat_id=U2)
+    await h.cmd_start(upd, make_ctx(bot, cfg, database, ["fb_1"]))
+    await answer(U2, "Orario sondaggi?", "Prima")
+    # U1 ha già finito: gli offre di cambiare; cambia la prima risposta in "No"
+    mk = []
+    upd, rep = make_update(user_id=U1, chat_id=U1, markups=mk)
+    await h.cmd_start(upd, make_ctx(bot, cfg, database, ["fb_1"]))
+    assert "già risposto" in rep[0]
+    await h.cb_feedback_redo(make_cb(buttons(mk[0])[0].callback_data, chat_id=U1, user_id=U1)[0], ctx)
+    await answer(U1, "Domanda 1/2", "No")
+    await answer(U1, "Domanda 2/2", "Prima")
+
+    # --- /risultati_feedback
+    upd, rep = make_update()
+    await h.cmd_feedback_results(upd, make_ctx(bot, cfg, database, []))
+    assert "#1</b> – 2 domande · 2 persone" in rep[0]
+    upd, rep = make_update()
+    await h.cmd_feedback_results(upd, make_ctx(bot, cfg, database, ["1"]))
+    r = rep[0]
+    assert "2 persone hanno risposto" in r
+    assert "<code>  0%</code> · 0 voti – Sì" in r and "<code>100%</code> · 2 voti – No" in r
+    assert "<code>100%</code> · 2 voti – Prima" in r
+    assert "start=fbd_1_2" in r
+    upd, rep = make_update()
+    await h.cmd_feedback_results(upd, make_ctx(bot, cfg, database, ["1", "2"]))
+    assert "@u502, @u501" in rep[0] and "<b>Va bene</b> – 0% · 0 voti\n–" in rep[0]
+    # il link "dettaglio" apre /start fbd_1_1 (solo admin)
+    upd, rep = make_update()
+    await h.cmd_start(upd, make_ctx(bot, cfg, database, ["fbd_1_1"]))
+    assert "domanda 1" in rep[0] and "<b>No</b> – 100% · 2 voti" in rep[0]
+    upd, rep = make_update(user_id=U1, chat_id=U1)
+    await h.cmd_start(upd, make_ctx(bot, cfg, database, ["fbd_1_1"]))
+    assert "Bot sondaggi" in rep[0]
 
 
 def test_full_flow():
