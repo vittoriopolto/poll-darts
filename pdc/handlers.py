@@ -126,10 +126,11 @@ HELP_ADMIN = (
     "/sessione_evento <i>id_sessione</i> <i>id_evento</i>|nessuno – sposta una sessione\n\n"
     "<b>Comandi admin (in privato)</b>\n"
     "/crea_sessione – crea una sessione (nome, partite, orario)\n"
-    "/sessioni – elenco delle ultime sessioni\n"
-    "/partite <i>id</i> – evento, sessione, orario e elenco partite (testo)\n"
+    "/sessioni – ultime sessioni con le partite e i loro ID\n"
+    "/partite <i>id</i> – elenco partite in testo; in privato chiede se mandarlo nel gruppo\n"
     "/risultati_sessione <i>id</i> – inserisci i vincitori (riprende da dove eri rimasto)\n"
     "/risultati_sessione <i>id</i> tutte – rivedi/correggi tutti i risultati\n"
+    "/risultato_partita <i>id_partita</i> – dai/correggi il risultato di una sola partita (ID in /sessioni)\n"
     "/delete_event <i>id o nome</i> – elimina un evento (con o senza le sue sessioni)\n"
     "/delete_session <i>id</i> – elimina una sessione con partite e voti\n"
     "/delete_match <i>id_sessione</i> [<i>n° partita</i>] – elimina una partita e i suoi voti\n\n"
@@ -263,6 +264,19 @@ async def new_session_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
     return ConversationHandler.END
 
 
+def _chunks(blocks: list[str], limit: int = 3800) -> list[str]:
+    """Unisce i blocchi in messaggi sotto il limite di Telegram (4096 caratteri)."""
+    out, cur = [], ""
+    for blk in blocks:
+        if cur and len(cur) + len(blk) + 2 > limit:
+            out.append(cur)
+            cur = ""
+        cur = f"{cur}\n\n{blk}" if cur else blk
+    if cur:
+        out.append(cur)
+    return out
+
+
 async def cmd_sessions(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_admin(update, ctx):
         return
@@ -271,33 +285,92 @@ async def cmd_sessions(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not sessions:
         await reply(update, "Nessuna sessione. Creane una con /crea_sessione")
         return
-    out = []
+    blocks = []
     for s in sessions:
         matches = await db(ctx).get_matches(s.id)
         done = sum(m.winner is not None for m in matches)
         state = ("🔒 chiusa" if s.closed_at else "🟢 sondaggi aperti") if s.launched_at else "📝 da lanciare"
         ev = f" · evento #{s.event_id}" if s.event_id else ""
-        out.append(f"<b>#{s.id}</b> {escape(s.name)} – {fmt_dt(s.starts_at, c.tz)}\n"
-                   f"    {state} · risultati {done}/{len(matches)}{ev}")
-    await reply(update, "\n".join(out))
+        lines = [f"<b>#{s.id}</b> {escape(s.name)} – {fmt_dt(s.starts_at, c.tz)}",
+                 f"    {state} · risultati {done}/{len(matches)}{ev}"]
+        for m in matches:
+            res = "" if m.winner is None else f" → {escape(_winner_text(m))}"
+            lines.append(f"    <code>{m.id}</code> · {m.position}. {escape(m.label())}{res}")
+        blocks.append("\n".join(lines))
+    blocks.append("ID partita a sinistra: per dare o correggere un risultato <code>/risultato_partita ID</code>")
+    for text in _chunks(blocks):
+        await reply(update, text)
 
 
-async def cmd_matches(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """/partite <id_sessione>: evento, sessione, orario e l'elenco delle partite, in testo."""
-    if not is_admin(update, ctx):
-        return
+async def _matches_text(ctx: ContextTypes.DEFAULT_TYPE, s: Session) -> str:
     d = db(ctx)
-    sid = parse_session_arg(ctx)
-    s = await d.get_session(sid) if sid else None
-    if not s:
-        await reply(update, "Uso: /partite <i>id_sessione</i> (vedi /sessioni)")
-        return
     ev = await d.get_event(s.event_id) if s.event_id else None
     matches = await d.get_matches(s.id)
     lines = "\n".join(f"{m.position}. {escape(m.label())}" for m in matches) or "Nessuna partita."
-    await reply(update, f"🏆 {escape(ev.name) if ev else 'Nessun evento'}\n"
-                        f"📁 {escape(s.name)}\n"
-                        f"⏰ {fmt_dt(s.starts_at, cfg(ctx).tz)}\n\n{lines}")
+    return (f"🏆 {escape(ev.name) if ev else 'Nessun evento'}\n"
+            f"📁 {escape(s.name)}\n"
+            f"⏰ {fmt_dt(s.starts_at, cfg(ctx).tz)}\n\n{lines}")
+
+
+async def _matches_target_group(ctx: ContextTypes.DEFAULT_TYPE, s: Session) -> int | None:
+    """Gruppo in cui mandare l'elenco: quello della sessione, altrimenti quello dell'ultima sessione lanciata."""
+    return s.chat_id or await db(ctx).last_group_chat()
+
+
+async def cmd_matches(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """/partite <id_sessione>: evento, sessione, orario e l'elenco delle partite, in testo.
+
+    In privato mostra l'elenco e chiede con un bottone se mandarlo nel gruppo; nel gruppo cancella
+    il comando e manda l'elenco come messaggio a sé (non come risposta)."""
+    if not is_admin(update, ctx):
+        return
+    chat = update.effective_chat
+    sid = parse_session_arg(ctx)
+    s = await db(ctx).get_session(sid) if sid else None
+    if not s:
+        await reply(update, "Uso: /partite <i>id_sessione</i> (vedi /sessioni)")
+        return
+    text = await _matches_text(ctx, s)
+    if chat.type != ChatType.PRIVATE:
+        try:
+            await update.effective_message.delete()
+        except TelegramError:
+            pass
+        await ctx.bot.send_message(chat.id, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        return
+    await reply(update, text)
+    if await _matches_target_group(ctx, s) is None:
+        await reply(update, "Nessun gruppo conosciuto: lancia <code>/partite</code> direttamente nel gruppo.")
+        return
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("📣 Sì, manda nel gruppo", callback_data=f"ptg:{s.id}"),
+                                InlineKeyboardButton("No", callback_data="ptg:no")]])
+    await reply(update, "Le mando nel gruppo?", reply_markup=kb)
+
+
+async def cb_matches_to_group(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not is_admin(update, ctx):
+        await q.answer("Solo admin", show_alert=True)
+        return
+    arg = q.data.split(":")[1]
+    s = await db(ctx).get_session(int(arg)) if arg.isdigit() else None
+    if not s:
+        await q.answer()
+        await q.edit_message_text("Ok, non le mando.")
+        return
+    group = await _matches_target_group(ctx, s)
+    if group is None:
+        await q.answer("Nessun gruppo conosciuto", show_alert=True)
+        return
+    await q.answer("Mando…")
+    try:
+        await ctx.bot.send_message(group, await _matches_text(ctx, s), parse_mode=ParseMode.HTML,
+                                   disable_web_page_preview=True)
+    except TelegramError as e:
+        log.warning("elenco partite non inviato al gruppo %s: %s", group, e)
+        await q.edit_message_text("⚠️ Non sono riuscito a mandarle nel gruppo.")
+        return
+    await q.edit_message_text("📣 Elenco partite mandato nel gruppo.")
 
 
 def _private_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -640,7 +713,8 @@ def _result_keyboard(m: Match, mode: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(f"🏆 {m.player1}", callback_data=f"r:{mode}:{m.id}:1")],
         [InlineKeyboardButton(f"🏆 {m.player2}", callback_data=f"r:{mode}:{m.id}:2")],
         [InlineKeyboardButton("🚫 Non disputata", callback_data=f"r:{mode}:{m.id}:0"),
-         InlineKeyboardButton("⏸ Sessione non conclusa", callback_data=f"r:{mode}:{m.id}:stop")],
+         InlineKeyboardButton("❌ Annulla" if mode == "s" else "⏸ Sessione non conclusa",
+                              callback_data=f"r:{mode}:{m.id}:stop")],
     ])
 
 
@@ -699,6 +773,24 @@ async def cmd_results(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await _ask_next(ctx, update.effective_chat.id, sid, mode, 0)
 
 
+async def cmd_match_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """/risultato_partita <id_partita>: dà o corregge il risultato di una sola partita."""
+    if not is_admin(update, ctx):
+        return
+    if update.effective_chat.type != ChatType.PRIVATE:
+        await reply(update, "Inserisci i risultati in privato con il bot.")
+        return
+    mid = parse_session_arg(ctx)
+    m = await db(ctx).get_match(mid) if mid else None
+    if not m:
+        await reply(update, "Uso: /risultato_partita <i>id_partita</i> (gli ID sono in /sessioni)")
+        return
+    s = await db(ctx).get_session(m.session_id)
+    cur = "" if m.winner is None else f"\n(attuale: {escape(_winner_text(m))})"
+    await reply(update, f"📋 {escape(s.name) if s else ''} · partita {m.position}\n<b>{escape(m.label())}</b>\n\n"
+                        f"Chi ha vinto?{cur}", reply_markup=_result_keyboard(m, "s"))
+
+
 async def cb_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     if not is_admin(update, ctx):
@@ -710,6 +802,10 @@ async def cb_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if m is None:
         await q.answer("Partita non trovata")
         return
+    if value == "stop" and mode == "s":
+        await q.answer()
+        await q.edit_message_text(f"Nessuna modifica a {escape(m.label())}.")
+        return
     if value == "stop":
         await q.answer("Ok, mi fermo qui")
         await q.edit_message_text(
@@ -720,6 +816,8 @@ async def cb_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     m.winner = int(value)
     await q.edit_message_text(f"✅ {m.position}. {escape(m.label())} → <b>{escape(_winner_text(m))}</b>",
                               parse_mode=ParseMode.HTML)
+    if mode == "s":
+        return
     await _ask_next(ctx, q.message.chat.id, m.session_id, mode, m.position)
 
 
@@ -1307,6 +1405,7 @@ def setup(app: Application) -> None:
     app.add_handler(CommandHandler("smuta", cmd_unmute))
     app.add_handler(CommandHandler("membri", cmd_members))
     app.add_handler(CommandHandler("risultati_sessione", cmd_results))
+    app.add_handler(CommandHandler("risultato_partita", cmd_match_result))
     app.add_handler(CommandHandler("ranking", cmd_ranking))
     app.add_handler(CommandHandler("ranking_sessione", cmd_ranking_session))
     app.add_handler(CommandHandler("ranking_evento", cmd_ranking_event))
@@ -1316,6 +1415,7 @@ def setup(app: Application) -> None:
     app.add_handler(CommandHandler("sessione_evento", cmd_session_event))
     app.add_handler(CallbackQueryHandler(cb_result, pattern=r"^r:"))
     app.add_handler(CallbackQueryHandler(cb_publish, pattern=r"^pub:"))
+    app.add_handler(CallbackQueryHandler(cb_matches_to_group, pattern=r"^ptg:"))
     app.add_handler(CallbackQueryHandler(cb_delete, pattern=r"^del[xsem]"))
     app.add_handler(PollAnswerHandler(on_poll_answer))
     app.add_handler(ChatMemberHandler(on_chat_member, ChatMemberHandler.CHAT_MEMBER))
@@ -1333,6 +1433,7 @@ BOT_COMMANDS_PRIVATE = [
     ("sessioni", "Elenco sessioni"),
     ("partite", "Elenco partite di una sessione: /partite id"),
     ("risultati_sessione", "Inserisci i risultati: /risultati_sessione id"),
+    ("risultato_partita", "Risultato di una partita: /risultato_partita id"),
     ("ranking", "Classifica globale"),
     ("ranking_evento", "Classifica di un evento"),
     ("ranking_sessione", "Classifica di una sessione"),

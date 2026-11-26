@@ -141,6 +141,7 @@ async def scenario():
     await h.cmd_matches(upd, make_ctx(bot, cfg, database, ["1"]))
     assert rep[0].startswith("🏆 Open di Natale\n📁 Mercoledì pomeriggio\n⏰ ")
     assert rep[0].endswith("\n\n1. Rossi - Bianchi\n2. Verdi - Neri\n3. Gialli - Blu"), rep[0]
+    assert "Nessun gruppo conosciuto" in rep[1]            # sessione mai lanciata, nessun gruppo noto
     upd, rep = make_update()
     await h.cmd_matches(upd, make_ctx(bot, cfg, database, ["99"]))
     assert "Uso: /partite" in rep[0]
@@ -170,6 +171,30 @@ async def scenario():
     upd, rep = make_update(chat_id=GROUP, chat_type="supergroup")
     await h.cmd_launch(upd, make_ctx(bot, cfg, database, ["1"]))
     assert "già stata lanciata" in rep[0]
+
+    # --- /partite dopo il lancio: in privato bottone per mandarle nel gruppo
+    markups = []
+    upd, rep = make_update(markups=markups)
+    await h.cmd_matches(upd, make_ctx(bot, cfg, database, ["1"]))
+    assert rep[1] == "Le mando nel gruppo?"
+    assert [b.callback_data for b in markups[1].inline_keyboard[0]] == ["ptg:1", "ptg:no"]
+    n = len(bot.calls)
+    upd, edits = make_cb("ptg:no")
+    await h.cb_matches_to_group(upd, make_ctx(bot, cfg, database))
+    assert len(bot.calls) == n and "non le mando" in edits[0]
+    upd, edits = make_cb("ptg:1")
+    await h.cb_matches_to_group(upd, make_ctx(bot, cfg, database))
+    assert bot.calls[-1][0] == "msg" and bot.calls[-1][1][0] == GROUP
+    assert bot.calls[-1][1][1].startswith("🏆 Open di Natale") and "mandato nel gruppo" in edits[0]
+    # nel gruppo: comando cancellato, elenco come messaggio a sé (non risposta)
+    upd, rep = make_update(chat_id=GROUP, chat_type="supergroup")
+    deleted = []
+    async def _del():
+        deleted.append(True)
+    upd.effective_message.delete = _del
+    await h.cmd_matches(upd, make_ctx(bot, cfg, database, ["1"]))
+    assert rep == [] and deleted == [True]
+    assert bot.calls[-1][0] == "msg" and bot.calls[-1][1][0] == GROUP and "reply_to_message_id" not in bot.calls[-1][2]
 
     # --- voti: poll1000 = Rossi-Bianchi, poll1001 = Verdi-Neri, poll1002 = Gialli-Blu
     ctx = make_ctx(bot, cfg, database)
@@ -206,6 +231,33 @@ async def scenario():
     bot.calls.clear()
     await h.cb_result(make_cb(f"r:m:{m3.id}:2")[0], ctx)        # vince Blu
     assert "Tutte le 3 partite" in bot.calls[-1][1][1]
+
+    # /sessioni: riga di stato + partite con ID e vincitore
+    upd, rep = make_update()
+    await h.cmd_sessions(upd, make_ctx(bot, cfg, database))
+    assert "risultati 3/3" in rep[0]
+    assert f"<code>{m1.id}</code> · 1. Rossi - Bianchi → Rossi" in rep[0]
+    assert f"<code>{m3.id}</code> · 3. Gialli - Blu → Blu" in rep[0]
+    assert len(h._chunks(["x" * 1500] * 5)) == 3                # messaggi lunghi spezzati
+
+    # /risultato_partita: correggo solo la partita 3, senza rifare il giro
+    markups = []
+    upd, rep = make_update(markups=markups)
+    await h.cmd_match_result(upd, make_ctx(bot, cfg, database, [str(m3.id)]))
+    assert "Gialli - Blu" in rep[0] and "(attuale: Blu)" in rep[0]
+    assert markups[0].inline_keyboard[2][1].text == "❌ Annulla"
+    upd, edits = make_cb(f"r:s:{m3.id}:stop")
+    await h.cb_result(upd, ctx)
+    assert "Nessuna modifica" in edits[0] and (await database.get_match(m3.id)).winner == 2
+    bot.calls.clear()
+    upd, edits = make_cb(f"r:s:{m3.id}:1")
+    await h.cb_result(upd, ctx)
+    assert "→ <b>Gialli</b>" in edits[0] and bot.calls == []    # nessuna domanda successiva
+    assert (await database.get_match(m3.id)).winner == 1
+    await h.cb_result(make_cb(f"r:s:{m3.id}:2")[0], ctx)        # rimetto Blu
+    upd, rep = make_update()
+    await h.cmd_match_result(upd, make_ctx(bot, cfg, database, ["9999"]))
+    assert "Uso: /risultato_partita" in rep[0]
 
     # --- step 4: classifica
     rows = await database.ranking(session_id=1)
