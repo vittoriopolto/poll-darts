@@ -136,6 +136,18 @@ async def scenario():
     assert "ID sessione: <b>1</b>" in edits[0]
     assert (await database.get_session(1)).event_id == 1
 
+    # --- /partite: evento, sessione, orario, elenco
+    upd, rep = make_update()
+    await h.cmd_matches(upd, make_ctx(bot, cfg, database, ["1"]))
+    assert rep[0].startswith("🏆 Open di Natale\n📁 Mercoledì pomeriggio\n⏰ ")
+    assert rep[0].endswith("\n\n1. Rossi - Bianchi\n2. Verdi - Neri\n3. Gialli - Blu"), rep[0]
+    upd, rep = make_update()
+    await h.cmd_matches(upd, make_ctx(bot, cfg, database, ["99"]))
+    assert "Uso: /partite" in rep[0]
+    upd, rep = make_update(user_id=999, chat_id=999)
+    await h.cmd_matches(upd, make_ctx(bot, cfg, database, ["1"]))
+    assert rep == []
+
     # non admin non può creare
     upd, rep = make_update(user_id=999, chat_id=999)
     assert await h.new_session_start(upd, make_ctx(bot, cfg, database)) == -1
