@@ -82,6 +82,40 @@ async def register_user(ctx: ContextTypes.DEFAULT_TYPE, user, chat_id: int | Non
         log.exception("upsert_user fallito")
 
 
+# ---------------------------------------------------------------- impostazioni utente
+
+def _settings_text(tag: bool) -> str:
+    stato = "✅ attivo" if tag else "🛑 disattivo"
+    spiega = ("in classifica compari con la @ e ricevi la notifica del tag" if tag
+              else "in classifica compari col nome senza @, nessuna notifica")
+    return f"⚙️ <b>Impostazioni</b>\n\nStato tag: <b>{stato}</b>\n<i>({spiega})</i>"
+
+
+def _settings_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("✅ Start Tag", callback_data="tag:on"),
+                                  InlineKeyboardButton("🛑 Stop Tag", callback_data="tag:off")]])
+
+
+async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat.type != ChatType.PRIVATE:
+        await reply(update, f"Scrivimi in privato: <a href=\"{_deep_link(ctx, 'impostazioni')}\">/impostazioni</a>")
+        return
+    await register_user(ctx, update.effective_user)
+    tag = await db(ctx).tag_enabled(update.effective_user.id)
+    await reply(update, _settings_text(tag), reply_markup=_settings_kb())
+
+
+async def cb_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    user = update.effective_user
+    await register_user(ctx, user)
+    tag = q.data == "tag:on"
+    await db(ctx).set_tag_enabled(user.id, tag)
+    await ctx.bot.send_message(update.effective_chat.id, _settings_text(tag), parse_mode=ParseMode.HTML,
+                               reply_markup=_settings_kb())
+
+
 # ---------------------------------------------------------------- comandi base
 
 HELP_ADMIN = (
@@ -112,6 +146,7 @@ HELP_ALL = (
     "/ranking – classifica globale (aggiungi <i>txt</i> per averla solo come testo)\n"
     "/ranking_evento [<i>id o nome</i>] – classifica di un evento (default: quello in corso o l'ultimo)\n"
     "/ranking_sessione [<i>id</i>] – classifica di una sessione (default: l'ultima)\n"
+    "/impostazioni – in privato: scegli se essere taggato con la @ in classifica\n"
     "/mio_id – mostra il tuo ID Telegram"
 )
 
@@ -120,6 +155,9 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await register_user(ctx, update.effective_user)
     # Deep link dai bottoni: /start fb_ID (rispondi al feedback), /start fbd_ID_N (dettaglio, admin).
     arg = ctx.args[0] if ctx.args else ""
+    if update.effective_chat.type == ChatType.PRIVATE and arg == "impostazioni":
+        await cmd_settings(update, ctx)
+        return
     if update.effective_chat.type == ChatType.PRIVATE and arg.startswith("fb"):
         kind, _, rest = arg.partition("_")
         nums = rest.split("_")
@@ -1238,6 +1276,8 @@ def setup(app: Application) -> None:
     app.add_handler(CallbackQueryHandler(cb_feedback_redo, pattern=r"^fbr:"))
     app.add_handler(CommandHandler(["start", "help", "aiuto"], cmd_start))
     app.add_handler(CommandHandler("mio_id", cmd_my_id))
+    app.add_handler(CommandHandler(["impostazioni", "settings"], cmd_settings))
+    app.add_handler(CallbackQueryHandler(cb_settings, pattern=r"^tag:(on|off)$"))
     app.add_handler(CommandHandler("sessioni", cmd_sessions))
     app.add_handler(CommandHandler(["delete_session", "elimina_sessione"], cmd_delete_session))
     app.add_handler(CommandHandler("delete_event", cmd_delete_event))
@@ -1277,6 +1317,7 @@ BOT_COMMANDS_PRIVATE = [
     ("ranking_sessione", "Classifica di una sessione"),
     ("crea_feedback", "Crea un feedback (domande e risposte)"),
     ("risultati_feedback", "Risultati feedback: /risultati_feedback id [n]"),
+    ("impostazioni", "Tag in classifica: attivo o disattivo"),
     ("annulla", "Annulla la creazione in corso"),
 ]
 BOT_COMMANDS_GROUP = [

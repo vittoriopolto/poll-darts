@@ -95,3 +95,6 @@ CREATE TABLE IF NOT EXISTS feedback_answers (
     answered_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (question_id, user_id)
 );
+
+-- Aggiunto dopo: l'utente può scegliere (/impostazioni) di non essere taggato con la @.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS tag_enabled BOOLEAN NOT NULL DEFAULT TRUE;

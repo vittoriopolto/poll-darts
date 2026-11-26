@@ -78,9 +78,10 @@ def clean_dsn(dsn: str) -> str:
     return urlunsplit(parts._replace(query=urlencode(query)))
 
 
-def display_name(username: str | None, first: str | None, last: str | None) -> str:
+def display_name(username: str | None, first: str | None, last: str | None, tag: bool = True) -> str:
+    """Nome da mostrare: @username (tag) oppure username senza @ se l'utente ha disattivato il tag."""
     if username:
-        return f"@{username}"
+        return f"@{username}" if tag else username
     full = " ".join(p for p in (first, last) if p)
     return full or "?"
 
@@ -122,6 +123,13 @@ class DB:
                        SET last_seen = now(), status = COALESCE($3, group_members.status)""",
                     chat_id, user_id, status,
                 )
+
+    async def tag_enabled(self, user_id: int) -> bool:
+        val = await self.pool.fetchval("SELECT tag_enabled FROM users WHERE user_id = $1", user_id)
+        return True if val is None else val
+
+    async def set_tag_enabled(self, user_id: int, enabled: bool) -> None:
+        await self.pool.execute("UPDATE users SET tag_enabled = $2 WHERE user_id = $1", user_id, enabled)
 
     async def count_members(self, chat_id: int) -> int:
         return await self.pool.fetchval(
@@ -348,7 +356,7 @@ class DB:
         chat_id -> tutte le sessioni lanciate in quel gruppo; nessuno -> tutte le sessioni.
         """
         rows = await self.pool.fetch(
-            """SELECT u.user_id, u.username, u.first_name, u.last_name,
+            """SELECT u.user_id, u.username, u.first_name, u.last_name, u.tag_enabled,
                       count(*) FILTER (WHERE m.winner IS NOT NULL AND v.choice = m.winner) AS points,
                       count(*) FILTER (WHERE m.winner IN (1, 2)) AS answered
                FROM votes v
@@ -360,7 +368,7 @@ class DB:
                GROUP BY u.user_id
                ORDER BY points DESC, lower(COALESCE(u.username, u.first_name, ''))""",
             session_id, chat_id, event_id)
-        return [RankRow(r["user_id"], display_name(r["username"], r["first_name"], r["last_name"]),
+        return [RankRow(r["user_id"], display_name(r["username"], r["first_name"], r["last_name"], r["tag_enabled"]),
                         r["points"], r["answered"]) for r in rows]
 
     async def results_progress(self, *, session_id: int | None = None, chat_id: int | None = None,
@@ -455,10 +463,11 @@ class DB:
     async def feedback_voters(self, question_id: int) -> dict[int, list[str]]:
         """option_id -> nomi di chi l'ha scelta (in ordine di risposta)."""
         rows = await self.pool.fetch(
-            """SELECT a.option_id, u.username, u.first_name, u.last_name
+            """SELECT a.option_id, u.username, u.first_name, u.last_name, u.tag_enabled
                FROM feedback_answers a JOIN users u ON u.user_id = a.user_id
                WHERE a.question_id = $1 ORDER BY a.answered_at""", question_id)
         out: dict[int, list[str]] = {}
         for r in rows:
-            out.setdefault(r["option_id"], []).append(display_name(r["username"], r["first_name"], r["last_name"]))
+            out.setdefault(r["option_id"], []).append(display_name(r["username"], r["first_name"], r["last_name"],
+                                                                    r["tag_enabled"]))
         return out

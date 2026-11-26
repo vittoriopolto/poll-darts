@@ -226,6 +226,20 @@ async def scenario():
     await h.close_due_polls(make_ctx(bot, cfg, database))
     assert bot.calls == []  # non richiude due volte
 
+    # classifica: chi ha disattivato il tag compare senza @
+    names = [r.display for r in await database.ranking()]
+    voter = next(n for n in names if n.startswith("@"))
+    uid = int(voter.lstrip("@player"))
+    await database.set_tag_enabled(uid, False)
+    names2 = [r.display for r in await database.ranking()]
+    assert voter[1:] in names2 and voter not in names2
+    bot.calls.clear()
+    upd, rep = make_update()
+    await h.cmd_ranking(upd, make_ctx(bot, cfg, database, ["txt"]))
+    txt = (bot.calls[0][1][1] if bot.calls else "") + "".join(rep)
+    assert f" {voter[1:]}" in txt and voter not in txt
+    await database.set_tag_enabled(uid, True)
+
     # --- eventi: classifica evento, chiusura, sessione fuori evento
     assert {r.display: r.points for r in await database.ranking(event_id=1)} == pts
     bot.calls.clear()
@@ -392,6 +406,27 @@ async def feedback_scenario(bot, cfg, database):
     upd, rep = make_update(user_id=U1, chat_id=U1)
     await h.cmd_start(upd, make_ctx(bot, cfg, database, ["fbd_1_1"]))
     assert "Bot sondaggi" in rep[0]
+
+    # --- /impostazioni: stop/start tag
+    upd, rep = make_update(chat_id=GROUP, chat_type="supergroup")
+    await h.cmd_settings(upd, make_ctx(bot, cfg, database))
+    assert "start=impostazioni" in rep[0]
+    mk = []
+    upd, rep = make_update(user_id=U1, chat_id=U1, markups=mk)
+    await h.cmd_settings(upd, make_ctx(bot, cfg, database))
+    assert "Stato tag: <b>✅ attivo</b>" in rep[0]
+    assert [b.callback_data for b in mk[0].inline_keyboard[0]] == ["tag:on", "tag:off"]
+    bot.calls.clear()
+    await h.cb_settings(make_cb("tag:off", chat_id=U1, user_id=U1)[0], make_ctx(bot, cfg, database))
+    assert "Stato tag: <b>🛑 disattivo</b>" in bot.calls[-1][1][1]
+    assert not await database.tag_enabled(U1)
+    upd, rep = make_update()
+    await h.cmd_feedback_results(upd, make_ctx(bot, cfg, database, ["1", "2"]))
+    assert "@u502, u501" in rep[0]
+    await h.cb_settings(make_cb("tag:on", chat_id=U1, user_id=U1)[0], make_ctx(bot, cfg, database))
+    assert "Stato tag: <b>✅ attivo</b>" in bot.calls[-1][1][1]
+    assert await database.tag_enabled(U1)
+
 
 
 def test_full_flow():

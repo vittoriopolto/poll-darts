@@ -32,6 +32,7 @@ Stack: Python 3.12 · python-telegram-bot 22 · Postgres (Neon) · deploy su Ren
 | privato (admin) | `/risultati_feedback [ID]` | per ogni domanda: % e numero di voti per risposta, con il link 🔎 *dettaglio*. Senza ID: elenco dei feedback |
 | privato (admin) | `/risultati_feedback ID N` | chi ha votato cosa alla domanda N (lo stesso del link *dettaglio*) |
 | gruppo (admin) | `/muta`, `/smuta`, `/membri` | mute manuale; quanti membri il bot conosce |
+| privato (tutti) | `/impostazioni` | stato del tag con i bottoni ✅ Start Tag / 🛑 Stop Tag: con lo stop in classifica (testo, immagine, risultati feedback) compari col nome senza @, quindi niente notifica. Di default il tag è attivo |
 | ovunque | `/mio_id` | mostra il tuo ID Telegram (serve per `ADMIN_IDS`) |
 
 Formati orario accettati: `25/11/2026 15:30`, `25/11 15:30`, `domani 15:30`, `15:30` (fuso `Europe/Rome`).
