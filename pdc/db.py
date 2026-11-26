@@ -262,9 +262,16 @@ class DB:
         return await self.pool.fetchval("SELECT count(*) FROM votes WHERE match_id = $1", match_id)
 
     async def last_group_chat(self) -> int | None:
-        """Il gruppo dell'ultima sessione lanciata (per mandare messaggi dal privato)."""
+        """Il gruppo dove mandare messaggi dal privato: quello dell'ultima sessione lanciata,
+        altrimenti il gruppo in cui il bot ha visto attività più di recente (messaggi, voti, ingressi)."""
         return await self.pool.fetchval(
-            "SELECT chat_id FROM sessions WHERE chat_id IS NOT NULL ORDER BY launched_at DESC NULLS LAST, id DESC LIMIT 1")
+            """SELECT chat_id FROM (
+                 (SELECT chat_id, 0 AS pri, launched_at AS at FROM sessions WHERE chat_id IS NOT NULL
+                  ORDER BY launched_at DESC NULLS LAST, id DESC LIMIT 1)
+                 UNION ALL
+                 (SELECT chat_id, 1, max(last_seen) FROM group_members WHERE chat_id < 0
+                  GROUP BY chat_id ORDER BY max(last_seen) DESC LIMIT 1)
+               ) g ORDER BY pri LIMIT 1""")
 
     async def mark_launched(self, session_id: int, chat_id: int) -> None:
         await self.pool.execute(
