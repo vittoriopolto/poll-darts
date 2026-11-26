@@ -232,6 +232,33 @@ async def scenario():
     await h.cb_result(make_cb(f"r:m:{m3.id}:2")[0], ctx)        # vince Blu
     assert "Tutte le 3 partite" in bot.calls[-1][1][1]
 
+    # /sessioni: riga di stato + partite con ID e vincitore
+    upd, rep = make_update()
+    await h.cmd_sessions(upd, make_ctx(bot, cfg, database))
+    assert "risultati 3/3" in rep[0]
+    assert f"<code>{m1.id}</code> · 1. Rossi - Bianchi → Rossi" in rep[0]
+    assert f"<code>{m3.id}</code> · 3. Gialli - Blu → Blu" in rep[0]
+    assert len(h._chunks(["x" * 1500] * 5)) == 3                # messaggi lunghi spezzati
+
+    # /risultato_partita: correggo solo la partita 3, senza rifare il giro
+    markups = []
+    upd, rep = make_update(markups=markups)
+    await h.cmd_match_result(upd, make_ctx(bot, cfg, database, [str(m3.id)]))
+    assert "Gialli - Blu" in rep[0] and "(attuale: Blu)" in rep[0]
+    assert markups[0].inline_keyboard[2][1].text == "❌ Annulla"
+    upd, edits = make_cb(f"r:s:{m3.id}:stop")
+    await h.cb_result(upd, ctx)
+    assert "Nessuna modifica" in edits[0] and (await database.get_match(m3.id)).winner == 2
+    bot.calls.clear()
+    upd, edits = make_cb(f"r:s:{m3.id}:1")
+    await h.cb_result(upd, ctx)
+    assert "→ <b>Gialli</b>" in edits[0] and bot.calls == []    # nessuna domanda successiva
+    assert (await database.get_match(m3.id)).winner == 1
+    await h.cb_result(make_cb(f"r:s:{m3.id}:2")[0], ctx)        # rimetto Blu
+    upd, rep = make_update()
+    await h.cmd_match_result(upd, make_ctx(bot, cfg, database, ["9999"]))
+    assert "Uso: /risultato_partita" in rep[0]
+
     # --- step 4: classifica
     rows = await database.ranking(session_id=1)
     pts = {r.display: r.points for r in rows}
