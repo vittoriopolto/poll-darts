@@ -173,9 +173,40 @@ def ranking_image(title: str, subtitle: str, rows: list[tuple[int, str, int, int
     return _png(img)
 
 
+def feedback_image(title: str) -> bytes:
+    """Immagine piccola per /consigli: invito a dare feedback con freccia verso il bottone."""
+    W, H = 900, 420
+    img = _background(W, H)
+    _paste_logo(img, 755, 200, 250)
+    d = ImageDraw.Draw(img)
+    x, tx, max_w = 50, 84, 520
+    d.rectangle((x, 60, x + 8, 300), fill=RED)
+    # titolo come la copertina: prima parola bianca, il resto rosso
+    big = _shrink(d, title, 64, max_w, _title_font)
+    first, _, rest = title.partition(" ")
+    d.text((tx, 58), first, font=big, fill=WHITE)
+    if rest:
+        d.text((tx + d.textlength(first + " ", font=big), 58), rest, font=big, fill=RED)
+    head = "DAMMI QUALCHE FEEDBACK"
+    d.text((tx, 152), head, font=_shrink(d, head, 36, max_w), fill=WHITE)
+    d.text((tx, 196), "sul poll game: bastano pochi click", font=_font(24), fill=CREAM)
+    d.text((tx, 234), "i tuoi consigli ci aiutano a migliorarlo", font=_font(21), fill=MUTED)
+    # etichetta "RISPONDI QUI SOTTO" con freccia verso il basso
+    tag = _font(30, bold=True)
+    label = "RISPONDI QUI SOTTO"
+    tw = d.textlength(label, font=tag)
+    y0, y1 = 300, 364
+    d.rounded_rectangle((tx, y0, tx + tw + 130, y1), radius=14, fill=RED)
+    d.text((tx + 28, y0 + 14), label, font=tag, fill=WHITE)
+    ax = tx + tw + 78
+    d.rectangle((ax - 7, y0 + 12, ax + 7, y0 + 34), fill=WHITE)
+    d.polygon([(ax - 20, y0 + 32), (ax + 20, y0 + 32), (ax, y0 + 54)], fill=WHITE)
+    return _png(img)
+
+
 def chunks(rows: list, size: int = 30) -> list[list]:
     """Una classifica molto lunga viene divisa in più immagini."""
     return [rows[i:i + size] for i in range(0, len(rows), size)] or [[]]
 
 
-__all__ = ["cover_image", "ranking_image", "chunks"]
+__all__ = ["cover_image", "ranking_image", "feedback_image", "chunks"]

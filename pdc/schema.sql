@@ -63,3 +63,35 @@ CREATE INDEX IF NOT EXISTS votes_user_idx ON votes(user_id);
 -- Aggiunto dopo la prima versione: ogni sessione può appartenere a un evento.
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS event_id INTEGER REFERENCES events(id) ON DELETE SET NULL;
 CREATE INDEX IF NOT EXISTS sessions_event_idx ON sessions(event_id);
+
+-- Feedback: un "pool" di domande a risposta multipla, a cui gli utenti rispondono in privato.
+CREATE TABLE IF NOT EXISTS feedback_pools (
+    id          SERIAL PRIMARY KEY,
+    created_by  BIGINT NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS feedback_questions (
+    id          SERIAL PRIMARY KEY,
+    pool_id     INTEGER NOT NULL REFERENCES feedback_pools(id) ON DELETE CASCADE,
+    position    INTEGER NOT NULL,
+    text        TEXT NOT NULL,
+    UNIQUE (pool_id, position)
+);
+
+CREATE TABLE IF NOT EXISTS feedback_options (
+    id          SERIAL PRIMARY KEY,
+    question_id INTEGER NOT NULL REFERENCES feedback_questions(id) ON DELETE CASCADE,
+    position    INTEGER NOT NULL,
+    text        TEXT NOT NULL,
+    UNIQUE (question_id, position)
+);
+
+-- Una risposta per utente e domanda (se risponde di nuovo, si sovrascrive).
+CREATE TABLE IF NOT EXISTS feedback_answers (
+    question_id INTEGER NOT NULL REFERENCES feedback_questions(id) ON DELETE CASCADE,
+    user_id     BIGINT  NOT NULL REFERENCES users(user_id),
+    option_id   INTEGER NOT NULL REFERENCES feedback_options(id) ON DELETE CASCADE,
+    answered_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (question_id, user_id)
+);

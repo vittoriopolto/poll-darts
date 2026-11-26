@@ -27,6 +27,10 @@ Stack: Python 3.12 · python-telegram-bot 22 · Postgres (Neon) · deploy su Ren
 | privato (admin) | `/delete_session ID` | elimina una sessione con partite e voti; chiude i suoi sondaggi se ancora aperti |
 | privato (admin) | `/delete_match ID_SESSIONE [N]` | elimina la partita N (senza N mostra le partite come bottoni) e i suoi voti; le successive vengono rinumerate |
 | | | Ogni eliminazione chiede conferma con un bottone. I messaggi già pubblicati nel gruppo restano |
+| privato (admin) | `/crea_feedback` | crea un **feedback**: chiede il testo della domanda, poi le risposte una alla volta (*➕ Aggiungi risposta* / *✅ Fine domanda*), poi la domanda successiva, finché non premi *🛑 Stop feedback*. Restituisce l'**ID feedback** |
+| gruppo (admin) | `/consigli [ID]` | pubblica un'immagine "Dammi qualche feedback" con il bottone **Dai qualche consiglio sui sondaggi**: chi lo preme apre il bot in privato e risponde alle domande con i bottoni (default: l'ultimo feedback creato) |
+| privato (admin) | `/risultati_feedback [ID]` | per ogni domanda: % e numero di voti per risposta, con il link 🔎 *dettaglio*. Senza ID: elenco dei feedback |
+| privato (admin) | `/risultati_feedback ID N` | chi ha votato cosa alla domanda N (lo stesso del link *dettaglio*) |
 | gruppo (admin) | `/muta`, `/smuta`, `/membri` | mute manuale; quanti membri il bot conosce |
 | ovunque | `/mio_id` | mostra il tuo ID Telegram (serve per `ADMIN_IDS`) |
 
