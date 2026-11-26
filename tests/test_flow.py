@@ -142,6 +142,12 @@ async def scenario():
     assert rep[0].startswith("🏆 Open di Natale\n📁 Mercoledì pomeriggio\n⏰ ")
     assert rep[0].endswith("\n\n1. Rossi - Bianchi\n2. Verdi - Neri\n3. Gialli - Blu"), rep[0]
     assert "Nessun gruppo conosciuto" in rep[1]            # sessione mai lanciata, nessun gruppo noto
+    # nessuna sessione lanciata, ma il bot ha visto qualcuno scrivere nel gruppo: usa quel gruppo
+    await database.upsert_user(777, "u777", "Nome", None, GROUP, "left")  # "left": non conta tra i membri
+    assert await database.last_group_chat() == GROUP
+    upd, rep = make_update()
+    await h.cmd_matches(upd, make_ctx(bot, cfg, database, ["1"]))
+    assert rep[1] == "Le mando nel gruppo?"
     upd, rep = make_update()
     await h.cmd_matches(upd, make_ctx(bot, cfg, database, ["99"]))
     assert "Uso: /partite" in rep[0]
