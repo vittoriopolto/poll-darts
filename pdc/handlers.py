@@ -127,6 +127,7 @@ HELP_ADMIN = (
     "<b>Comandi admin (in privato)</b>\n"
     "/crea_sessione – crea una sessione (nome, partite, orario)\n"
     "/sessioni – elenco delle ultime sessioni\n"
+    "/partite <i>id</i> – evento, sessione, orario e elenco partite (testo)\n"
     "/risultati_sessione <i>id</i> – inserisci i vincitori (riprende da dove eri rimasto)\n"
     "/risultati_sessione <i>id</i> tutte – rivedi/correggi tutti i risultati\n"
     "/delete_event <i>id o nome</i> – elimina un evento (con o senza le sue sessioni)\n"
@@ -279,6 +280,24 @@ async def cmd_sessions(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         out.append(f"<b>#{s.id}</b> {escape(s.name)} – {fmt_dt(s.starts_at, c.tz)}\n"
                    f"    {state} · risultati {done}/{len(matches)}{ev}")
     await reply(update, "\n".join(out))
+
+
+async def cmd_matches(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """/partite <id_sessione>: evento, sessione, orario e l'elenco delle partite, in testo."""
+    if not is_admin(update, ctx):
+        return
+    d = db(ctx)
+    sid = parse_session_arg(ctx)
+    s = await d.get_session(sid) if sid else None
+    if not s:
+        await reply(update, "Uso: /partite <i>id_sessione</i> (vedi /sessioni)")
+        return
+    ev = await d.get_event(s.event_id) if s.event_id else None
+    matches = await d.get_matches(s.id)
+    lines = "\n".join(f"{m.position}. {escape(m.label())}" for m in matches) or "Nessuna partita."
+    await reply(update, f"🏆 {escape(ev.name) if ev else 'Nessun evento'}\n"
+                        f"📁 {escape(s.name)}\n"
+                        f"⏰ {fmt_dt(s.starts_at, cfg(ctx).tz)}\n\n{lines}")
 
 
 def _private_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -1279,6 +1298,7 @@ def setup(app: Application) -> None:
     app.add_handler(CommandHandler(["impostazioni", "settings"], cmd_settings))
     app.add_handler(CallbackQueryHandler(cb_settings, pattern=r"^tag:(on|off)$"))
     app.add_handler(CommandHandler("sessioni", cmd_sessions))
+    app.add_handler(CommandHandler("partite", cmd_matches))
     app.add_handler(CommandHandler(["delete_session", "elimina_sessione"], cmd_delete_session))
     app.add_handler(CommandHandler("delete_event", cmd_delete_event))
     app.add_handler(CommandHandler("delete_match", cmd_delete_match))
@@ -1311,6 +1331,7 @@ BOT_COMMANDS_PRIVATE = [
     ("eventi", "Elenco eventi"),
     ("crea_sessione", "Crea una sessione di sondaggi"),
     ("sessioni", "Elenco sessioni"),
+    ("partite", "Elenco partite di una sessione: /partite id"),
     ("risultati_sessione", "Inserisci i risultati: /risultati_sessione id"),
     ("ranking", "Classifica globale"),
     ("ranking_evento", "Classifica di un evento"),

@@ -23,6 +23,7 @@ Stack: Python 3.12 · python-telegram-bot 22 · Postgres (Neon) · deploy su Ren
 | gruppo / privato | `/ranking_evento [ID o nome]` | classifica di un evento (default: quello in corso, o l'ultimo chiuso) |
 | gruppo / privato | `/ranking_sessione [ID]` | classifica di una sessione (default: l'ultima lanciata nel gruppo) |
 | privato (admin) | `/sessioni` | elenco sessioni |
+| privato o gruppo (admin) | `/partite ID` | in testo: 🏆 nome evento, 📁 nome sessione, ⏰ orario di inizio e l'elenco delle partite |
 | privato (admin) | `/delete_event ID o nome` | elimina un evento: bottoni "evento + sessioni" (cancella tutto, voti compresi) o "solo l'evento" (le sessioni restano, senza evento) |
 | privato (admin) | `/delete_session ID` | elimina una sessione con partite e voti; chiude i suoi sondaggi se ancora aperti |
 | privato (admin) | `/delete_match ID_SESSIONE [N]` | elimina la partita N (senza N mostra le partite come bottoni) e i suoi voti; le successive vengono rinumerate |
