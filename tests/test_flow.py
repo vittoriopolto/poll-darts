@@ -141,6 +141,7 @@ async def scenario():
     await h.cmd_matches(upd, make_ctx(bot, cfg, database, ["1"]))
     assert rep[0].startswith("🏆 Open di Natale\n📁 Mercoledì pomeriggio\n⏰ ")
     assert rep[0].endswith("\n\n1. Rossi - Bianchi\n2. Verdi - Neri\n3. Gialli - Blu"), rep[0]
+    assert "Nessun gruppo conosciuto" in rep[1]            # sessione mai lanciata, nessun gruppo noto
     upd, rep = make_update()
     await h.cmd_matches(upd, make_ctx(bot, cfg, database, ["99"]))
     assert "Uso: /partite" in rep[0]
@@ -170,6 +171,30 @@ async def scenario():
     upd, rep = make_update(chat_id=GROUP, chat_type="supergroup")
     await h.cmd_launch(upd, make_ctx(bot, cfg, database, ["1"]))
     assert "già stata lanciata" in rep[0]
+
+    # --- /partite dopo il lancio: in privato bottone per mandarle nel gruppo
+    markups = []
+    upd, rep = make_update(markups=markups)
+    await h.cmd_matches(upd, make_ctx(bot, cfg, database, ["1"]))
+    assert rep[1] == "Le mando nel gruppo?"
+    assert [b.callback_data for b in markups[1].inline_keyboard[0]] == ["ptg:1", "ptg:no"]
+    n = len(bot.calls)
+    upd, edits = make_cb("ptg:no")
+    await h.cb_matches_to_group(upd, make_ctx(bot, cfg, database))
+    assert len(bot.calls) == n and "non le mando" in edits[0]
+    upd, edits = make_cb("ptg:1")
+    await h.cb_matches_to_group(upd, make_ctx(bot, cfg, database))
+    assert bot.calls[-1][0] == "msg" and bot.calls[-1][1][0] == GROUP
+    assert bot.calls[-1][1][1].startswith("🏆 Open di Natale") and "mandato nel gruppo" in edits[0]
+    # nel gruppo: comando cancellato, elenco come messaggio a sé (non risposta)
+    upd, rep = make_update(chat_id=GROUP, chat_type="supergroup")
+    deleted = []
+    async def _del():
+        deleted.append(True)
+    upd.effective_message.delete = _del
+    await h.cmd_matches(upd, make_ctx(bot, cfg, database, ["1"]))
+    assert rep == [] and deleted == [True]
+    assert bot.calls[-1][0] == "msg" and bot.calls[-1][1][0] == GROUP and "reply_to_message_id" not in bot.calls[-1][2]
 
     # --- voti: poll1000 = Rossi-Bianchi, poll1001 = Verdi-Neri, poll1002 = Gialli-Blu
     ctx = make_ctx(bot, cfg, database)

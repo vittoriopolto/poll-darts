@@ -127,7 +127,7 @@ HELP_ADMIN = (
     "<b>Comandi admin (in privato)</b>\n"
     "/crea_sessione – crea una sessione (nome, partite, orario)\n"
     "/sessioni – elenco delle ultime sessioni\n"
-    "/partite <i>id</i> – evento, sessione, orario e elenco partite (testo)\n"
+    "/partite <i>id</i> – elenco partite in testo; in privato chiede se mandarlo nel gruppo\n"
     "/risultati_sessione <i>id</i> – inserisci i vincitori (riprende da dove eri rimasto)\n"
     "/risultati_sessione <i>id</i> tutte – rivedi/correggi tutti i risultati\n"
     "/delete_event <i>id o nome</i> – elimina un evento (con o senza le sue sessioni)\n"
@@ -282,22 +282,75 @@ async def cmd_sessions(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await reply(update, "\n".join(out))
 
 
-async def cmd_matches(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """/partite <id_sessione>: evento, sessione, orario e l'elenco delle partite, in testo."""
-    if not is_admin(update, ctx):
-        return
+async def _matches_text(ctx: ContextTypes.DEFAULT_TYPE, s: Session) -> str:
     d = db(ctx)
-    sid = parse_session_arg(ctx)
-    s = await d.get_session(sid) if sid else None
-    if not s:
-        await reply(update, "Uso: /partite <i>id_sessione</i> (vedi /sessioni)")
-        return
     ev = await d.get_event(s.event_id) if s.event_id else None
     matches = await d.get_matches(s.id)
     lines = "\n".join(f"{m.position}. {escape(m.label())}" for m in matches) or "Nessuna partita."
-    await reply(update, f"🏆 {escape(ev.name) if ev else 'Nessun evento'}\n"
-                        f"📁 {escape(s.name)}\n"
-                        f"⏰ {fmt_dt(s.starts_at, cfg(ctx).tz)}\n\n{lines}")
+    return (f"🏆 {escape(ev.name) if ev else 'Nessun evento'}\n"
+            f"📁 {escape(s.name)}\n"
+            f"⏰ {fmt_dt(s.starts_at, cfg(ctx).tz)}\n\n{lines}")
+
+
+async def _matches_target_group(ctx: ContextTypes.DEFAULT_TYPE, s: Session) -> int | None:
+    """Gruppo in cui mandare l'elenco: quello della sessione, altrimenti quello dell'ultima sessione lanciata."""
+    return s.chat_id or await db(ctx).last_group_chat()
+
+
+async def cmd_matches(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """/partite <id_sessione>: evento, sessione, orario e l'elenco delle partite, in testo.
+
+    In privato mostra l'elenco e chiede con un bottone se mandarlo nel gruppo; nel gruppo cancella
+    il comando e manda l'elenco come messaggio a sé (non come risposta)."""
+    if not is_admin(update, ctx):
+        return
+    chat = update.effective_chat
+    sid = parse_session_arg(ctx)
+    s = await db(ctx).get_session(sid) if sid else None
+    if not s:
+        await reply(update, "Uso: /partite <i>id_sessione</i> (vedi /sessioni)")
+        return
+    text = await _matches_text(ctx, s)
+    if chat.type != ChatType.PRIVATE:
+        try:
+            await update.effective_message.delete()
+        except TelegramError:
+            pass
+        await ctx.bot.send_message(chat.id, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        return
+    await reply(update, text)
+    if await _matches_target_group(ctx, s) is None:
+        await reply(update, "Nessun gruppo conosciuto: lancia <code>/partite</code> direttamente nel gruppo.")
+        return
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("📣 Sì, manda nel gruppo", callback_data=f"ptg:{s.id}"),
+                                InlineKeyboardButton("No", callback_data="ptg:no")]])
+    await reply(update, "Le mando nel gruppo?", reply_markup=kb)
+
+
+async def cb_matches_to_group(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not is_admin(update, ctx):
+        await q.answer("Solo admin", show_alert=True)
+        return
+    arg = q.data.split(":")[1]
+    s = await db(ctx).get_session(int(arg)) if arg.isdigit() else None
+    if not s:
+        await q.answer()
+        await q.edit_message_text("Ok, non le mando.")
+        return
+    group = await _matches_target_group(ctx, s)
+    if group is None:
+        await q.answer("Nessun gruppo conosciuto", show_alert=True)
+        return
+    await q.answer("Mando…")
+    try:
+        await ctx.bot.send_message(group, await _matches_text(ctx, s), parse_mode=ParseMode.HTML,
+                                   disable_web_page_preview=True)
+    except TelegramError as e:
+        log.warning("elenco partite non inviato al gruppo %s: %s", group, e)
+        await q.edit_message_text("⚠️ Non sono riuscito a mandarle nel gruppo.")
+        return
+    await q.edit_message_text("📣 Elenco partite mandato nel gruppo.")
 
 
 def _private_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -1316,6 +1369,7 @@ def setup(app: Application) -> None:
     app.add_handler(CommandHandler("sessione_evento", cmd_session_event))
     app.add_handler(CallbackQueryHandler(cb_result, pattern=r"^r:"))
     app.add_handler(CallbackQueryHandler(cb_publish, pattern=r"^pub:"))
+    app.add_handler(CallbackQueryHandler(cb_matches_to_group, pattern=r"^ptg:"))
     app.add_handler(CallbackQueryHandler(cb_delete, pattern=r"^del[xsem]"))
     app.add_handler(PollAnswerHandler(on_poll_answer))
     app.add_handler(ChatMemberHandler(on_chat_member, ChatMemberHandler.CHAT_MEMBER))

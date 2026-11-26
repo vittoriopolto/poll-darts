@@ -261,6 +261,11 @@ class DB:
     async def match_votes(self, match_id: int) -> int:
         return await self.pool.fetchval("SELECT count(*) FROM votes WHERE match_id = $1", match_id)
 
+    async def last_group_chat(self) -> int | None:
+        """Il gruppo dell'ultima sessione lanciata (per mandare messaggi dal privato)."""
+        return await self.pool.fetchval(
+            "SELECT chat_id FROM sessions WHERE chat_id IS NOT NULL ORDER BY launched_at DESC NULLS LAST, id DESC LIMIT 1")
+
     async def mark_launched(self, session_id: int, chat_id: int) -> None:
         await self.pool.execute(
             "UPDATE sessions SET chat_id = $2, launched_at = now() WHERE id = $1", session_id, chat_id)
