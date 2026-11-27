@@ -102,3 +102,12 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS tag_enabled BOOLEAN NOT NULL DEFAULT 
 -- Aggiunto dopo: punteggio della partita (facoltativo, es. 6-4), oltre al vincitore.
 ALTER TABLE matches ADD COLUMN IF NOT EXISTS score1 SMALLINT;
 ALTER TABLE matches ADD COLUMN IF NOT EXISTS score2 SMALLINT;
+
+-- Aggiunto dopo: tabellone a eliminazione diretta di un evento (accoppiamenti del 1° turno in ordine).
+-- draw = lista JSON di giocatori [seed, nome, nazione], due per partita. I risultati si prendono dalle partite.
+CREATE TABLE IF NOT EXISTS brackets (
+    event_id    INTEGER PRIMARY KEY REFERENCES events(id) ON DELETE CASCADE,
+    title       TEXT,
+    draw        JSONB NOT NULL,
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);

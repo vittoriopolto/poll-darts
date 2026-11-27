@@ -116,7 +116,7 @@ def vote(poll_id, user_id, option_ids):
 async def scenario():
     import asyncpg
     con = await asyncpg.connect(DSN)
-    await con.execute("DROP TABLE IF EXISTS feedback_answers, feedback_options, feedback_questions, feedback_pools, votes, matches, sessions, events, group_members, users CASCADE")
+    await con.execute("DROP TABLE IF EXISTS brackets, feedback_answers, feedback_options, feedback_questions, feedback_pools, votes, matches, sessions, events, group_members, users CASCADE")
     await con.close()
 
     cfg = Config(bot_token="1:x", database_url=DSN, admin_ids=frozenset({ADMIN}), tz=TZ, public_url=None,
@@ -648,7 +648,7 @@ async def scenario_lookup(monkeypatch):
     import asyncpg
     from pdc import livescore
     con = await asyncpg.connect(DSN)
-    await con.execute("DROP TABLE IF EXISTS feedback_answers, feedback_options, feedback_questions, feedback_pools, votes, matches, sessions, events, group_members, users CASCADE")
+    await con.execute("DROP TABLE IF EXISTS brackets, feedback_answers, feedback_options, feedback_questions, feedback_pools, votes, matches, sessions, events, group_members, users CASCADE")
     await con.close()
     cfg = Config(bot_token="1:x", database_url=DSN, admin_ids=frozenset({ADMIN}), tz=TZ, public_url=None,
                  port=0, webhook_secret="s", close_minutes_before=5, cover_title="PDC180 POLL", mute_mode="invio")
@@ -733,3 +733,94 @@ async def scenario_lookup(monkeypatch):
 
 def test_lookup_flow(monkeypatch):
     asyncio.run(scenario_lookup(monkeypatch))
+
+
+async def scenario_bracket():
+    import asyncpg
+    con = await asyncpg.connect(DSN)
+    await con.execute("DROP TABLE IF EXISTS brackets, feedback_answers, feedback_options, feedback_questions, feedback_pools, votes, matches, sessions, events, group_members, users CASCADE")
+    await con.close()
+    cfg = Config(bot_token="1:x", database_url=DSN, admin_ids=frozenset({ADMIN}), tz=TZ, public_url=None,
+                 port=0, webhook_secret="s", close_minutes_before=5, cover_title="PDC180 POLL", mute_mode="invio")
+    database = await DB.connect(DSN, 5)
+    bot = FakeBot()
+    eid = await database.create_event("PC Finals 2026", ADMIN)
+    start = datetime.now(TZ).replace(microsecond=0) - timedelta(hours=1)
+    sid = await database.create_session("Venerdì", start, ADMIN,
+                                        [("🇳🇱 Nijman", "Coates"), ("Clemens", "Chisnall"), ("Manby", "Schindler")],
+                                        event_id=eid)
+    await database.mark_launched(sid, GROUP)
+    m1, m2, m3 = await database.get_matches(sid)
+    await database.set_winner(m2.id, 1, 6, 4)
+    await database.set_winner(m3.id, 2, 4, 6)
+
+    # /partite senza tabellone: domanda solita
+    upd, rep = make_update()
+    await h.cmd_matches(upd, make_ctx(bot, cfg, database, [str(sid)]))
+    assert rep[-1] == "Le mando nel gruppo?"
+
+    # /tabellone_imposta con il testo nello stesso messaggio
+    draw = ("/tabellone_imposta\nTitolo: Players Championship Finals\n"
+            "1 Wessel Nijman NED - 64 Henry Coates ENG\n32 Gabriel Clemens 🇩🇪 - 33 Dave Chisnall\n"
+            "16 Charlie Manby - 49 Martin Schindler GER\n17 Cameron Menzies SCO - 48 Mensur Suljović AUT")
+    ctx = make_ctx(bot, cfg, database)
+    upd, rep = make_update(text=draw)
+    assert await h.bracket_set_start(upd, ctx) == -1
+    assert "4 partite del 1° turno" in rep[0]
+    assert bot.calls[-2][0] == "photo" and "Players Championship Finals" in bot.calls[-2][2]["caption"]
+    assert "2/7 risultati" in bot.calls[-2][2]["caption"]
+    title, saved = await database.get_bracket(eid)
+    assert title == "Players Championship Finals" and saved[2] == [32, "Gabriel Clemens", "GER"]
+
+    # in due passi, con errore
+    ctx = make_ctx(bot, cfg, database)
+    upd, rep = make_update(text="/tabellone_imposta")
+    assert await h.bracket_set_start(upd, ctx) == h.BR_DRAW
+    upd, rep = make_update(text="A - B\nC - D\nE - F")
+    assert await h.bracket_set_text(upd, ctx) == h.BR_DRAW and "2, 4, 8" in rep[0]
+    upd, rep = make_update()
+    assert await h.bracket_set_cancel(upd, ctx) == -1
+    assert (await database.get_bracket(eid))[1] == saved
+
+    # /partite con tabellone: Aggiorno? sì -> anteprima, poi elenco + tabellone nel gruppo
+    markups = []
+    upd, rep = make_update(markups=markups)
+    await h.cmd_matches(upd, make_ctx(bot, cfg, database, [str(sid)]))
+    assert rep[-1] == "Aggiorno il tabellone?"
+    assert [b.callback_data for b in markups[-1].inline_keyboard[0]] == [f"ptb:{sid}:y", f"ptb:{sid}:n"]
+    bot.calls.clear()
+    upd, edits = make_cb(f"ptb:{sid}:y")
+    await h.cb_matches_bracket(upd, make_ctx(bot, cfg, database))
+    assert [c[0] for c in bot.calls] == ["photo", "msg"] and bot.calls[0][1][0] == ADMIN
+    kb = bot.calls[1][2]["reply_markup"].inline_keyboard
+    assert kb[0][0].callback_data == f"ptg:{sid}:lb"
+    bot.calls.clear()
+    upd, edits = make_cb(f"ptg:{sid}:lb")
+    await h.cb_matches_to_group(upd, make_ctx(bot, cfg, database))
+    assert [(c[0], c[1][0]) for c in bot.calls] == [("msg", GROUP), ("photo", GROUP)]
+    assert "Elenco partite e tabellone mandato" in edits[0]
+    bot.calls.clear()
+    upd, edits = make_cb(f"ptg:{sid}:b")
+    await h.cb_matches_to_group(upd, make_ctx(bot, cfg, database))
+    assert [c[0] for c in bot.calls] == ["photo"] and "Tabellone mandato" in edits[0]
+    # No -> domanda solita senza tabellone
+    bot.calls.clear()
+    upd, edits = make_cb(f"ptb:{sid}:n")
+    await h.cb_matches_bracket(upd, make_ctx(bot, cfg, database))
+    assert [c[0] for c in bot.calls] == ["msg"]
+    assert [b.callback_data for b in bot.calls[0][2]["reply_markup"].inline_keyboard[0]] == [f"ptg:{sid}", "ptg:no"]
+
+    # /tabellone in privato e bottone per il gruppo
+    bot.calls.clear()
+    upd, rep = make_update()
+    await h.cmd_bracket(upd, make_ctx(bot, cfg, database))
+    assert [c[0] for c in bot.calls] == ["photo", "msg"]
+    bot.calls.clear()
+    upd, edits = make_cb(f"tbg:{eid}")
+    await h.cb_bracket_to_group(upd, make_ctx(bot, cfg, database))
+    assert bot.calls[-1][0] == "photo" and bot.calls[-1][1][0] == GROUP and "mandato" in edits[0]
+    await database.close()
+
+
+def test_bracket_flow():
+    asyncio.run(scenario_bracket())
