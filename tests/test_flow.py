@@ -53,6 +53,9 @@ class FakeBot:
         self._log("msg", chat_id, text, **kw)
         return NS(message_id=next(self.ids))
 
+    async def edit_message_text(self, text, **kw):
+        self._log("edit", text, **kw)
+
     async def stop_poll(self, chat_id, message_id, **kw):
         self._log("stop", chat_id, message_id)
 
@@ -140,7 +143,7 @@ async def scenario():
     upd, rep = make_update()
     await h.cmd_matches(upd, make_ctx(bot, cfg, database, ["1"]))
     assert rep[0].startswith("🏆 Open di Natale\n📁 Mercoledì pomeriggio\n⏰ ")
-    assert rep[0].endswith("\n\n1. Rossi - Bianchi\n2. Verdi - Neri\n3. Gialli - Blu"), rep[0]
+    assert rep[0].endswith("\n\n⚠️ 1. Rossi - Bianchi\n⚠️ 2. Verdi - Neri\n⚠️ 3. Gialli - Blu"), rep[0]
     assert "Nessun gruppo conosciuto" in rep[1]            # sessione mai lanciata, nessun gruppo noto
     # nessuna sessione lanciata, ma il bot ha visto qualcuno scrivere nel gruppo: usa quel gruppo
     await database.upsert_user(777, "u777", "Nome", None, GROUP, "left")  # "left": non conta tra i membri
@@ -242,8 +245,12 @@ async def scenario():
     upd, rep = make_update()
     await h.cmd_sessions(upd, make_ctx(bot, cfg, database))
     assert "risultati 3/3" in rep[0]
-    assert f"<code>{m1.id}</code> · 1. Rossi - Bianchi → Rossi" in rep[0]
-    assert f"<code>{m3.id}</code> · 3. Gialli - Blu → Blu" in rep[0]
+    assert f'start=rp_{m1.id}">✏️{m1.id}</a> ✓ 1. <b>Rossi</b> - Bianchi' in rep[0]
+    assert f'✏️{m3.id}</a> ✓ 3. Gialli - <b>Blu</b>' in rep[0]
+    # un click su ✏️ = /start rp_ID: apre il risultato di quella partita
+    upd, rep = make_update()
+    await h.cmd_start(upd, make_ctx(bot, cfg, database, [f"rp_{m2.id}"]))
+    assert "Verdi - Neri" in rep[0] and "Chi ha vinto?" in rep[0]
     assert len(h._chunks(["x" * 1500] * 5)) == 3                # messaggi lunghi spezzati
 
     # /risultato_partita: correggo solo la partita 3, senza rifare il giro
@@ -261,6 +268,40 @@ async def scenario():
     assert "→ <b>Gialli</b>" in edits[0] and bot.calls == []    # nessuna domanda successiva
     assert (await database.get_match(m3.id)).winner == 1
     await h.cb_result(make_cb(f"r:s:{m3.id}:2")[0], ctx)        # rimetto Blu
+
+    # punteggio scritto a mano: "2-6" -> vince Blu 6-2
+    sctx = make_ctx(bot, cfg, database, [str(m3.id)])
+    upd, rep = make_update()
+    await h.cmd_match_result(upd, sctx)
+    assert "scrivi il punteggio" in rep[0]
+    upd, rep = make_update(text="3-3")
+    await h.on_score_text(upd, sctx)
+    assert "Pareggio" in rep[0]
+    upd, rep = make_update(text="ciao")
+    await h.on_score_text(upd, sctx)
+    assert rep == []                                            # testo qualsiasi: ignorato
+    upd, rep = make_update(text="2 - 6")
+    await h.on_score_text(upd, sctx)
+    assert "Blu (2-6)" in rep[0]
+    m3 = await database.get_match(m3.id)
+    assert (m3.winner, m3.score1, m3.score2) == (2, 2, 6)
+    upd, rep = make_update(text="6-0")
+    await h.on_score_text(upd, sctx)
+    assert rep == [] and (await database.get_match(m3.id)).score1 == 2   # niente più in attesa
+    upd, rep = make_update()
+    await h.cmd_matches(upd, make_ctx(bot, cfg, database, ["1"]))
+    assert "✓ 3. Gialli 2 - <b>6</b> <b>Blu</b>" in rep[0]
+    # bandiere: quella del giocatore 1 va dopo il nome, vicino al punteggio
+    from pdc.db import Match
+    mm = Match(1, 1, 15, "🏴 Cameron Menzies", "🇦🇹 Mensur Suljovic", None, None, 1, 3, 2)
+    assert h.match_line(mm) == "✓ 15. <b>Cameron Menzies</b> 🏴 <b>3</b> - 2 🇦🇹 Mensur Suljovic"
+    mm.winner, mm.score1, mm.score2 = None, None, None
+    assert h.match_line(mm) == "⚠️ 15. Cameron Menzies 🏴 - 🇦🇹 Mensur Suljovic"
+    mm.winner = 0
+    assert h.match_line(mm).startswith("🚫 15.")
+    # il bottone cancella il punteggio vecchio
+    await h.cb_result(make_cb(f"r:s:{m3.id}:2")[0], ctx)
+    assert (await database.get_match(m3.id)).score1 is None
     upd, rep = make_update()
     await h.cmd_match_result(upd, make_ctx(bot, cfg, database, ["9999"]))
     assert "Uso: /risultato_partita" in rep[0]
@@ -284,6 +325,15 @@ async def scenario():
     await h.cmd_ranking(upd, make_ctx(bot, cfg, database, ["TXT"]))
     assert [c[0] for c in bot.calls] == ["msg", "msg"]
     assert "Classifica sessione" in bot.calls[0][1][1] and "(2/3, 67%)" in bot.calls[0][1][1]
+    # comandi _txt: solo testo e nomi senza @
+    for cmd, fn, args in (("/ranking_sessione_txt 1", h.cmd_ranking_session, ["1"]),
+                          ("/ranking_txt", h.cmd_ranking, []),
+                          ("/ranking_evento_txt@pdc_test_bot", h.cmd_ranking_event, [])):
+        bot.calls.clear()
+        upd, _ = make_update(chat_id=GROUP, chat_type="supergroup", text=cmd)
+        await fn(upd, make_ctx(bot, cfg, database, args))
+        assert [c[0] for c in bot.calls] == ["msg"], cmd
+        assert "1. player1 – <b>2</b>" in bot.calls[0][1][1] and "@" not in bot.calls[0][1][1], cmd
 
     # --- chiusura: voti oltre l'orario ignorati, job chiude i sondaggi
     await database.pool.execute("UPDATE sessions SET starts_at = now() + interval '4 minutes'")

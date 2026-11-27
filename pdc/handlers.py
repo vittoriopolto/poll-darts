@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import logging
 import warnings
 from datetime import datetime, timedelta, timezone
@@ -130,7 +131,8 @@ HELP_ADMIN = (
     "/partite <i>id</i> – elenco partite in testo; in privato chiede se mandarlo nel gruppo\n"
     "/risultati_sessione <i>id</i> – inserisci i vincitori (riprende da dove eri rimasto)\n"
     "/risultati_sessione <i>id</i> tutte – rivedi/correggi tutti i risultati\n"
-    "/risultato_partita <i>id_partita</i> – dai/correggi il risultato di una sola partita (ID in /sessioni)\n"
+    "/risultato_partita <i>id_partita</i> – dai/correggi il risultato di una sola partita (o tocca ✏️ in /sessioni)\n"
+    "Quando il bot chiede chi ha vinto puoi anche scrivere il punteggio, es. <code>6-4</code>\n"
     "/delete_event <i>id o nome</i> – elimina un evento (con o senza le sue sessioni)\n"
     "/delete_session <i>id</i> – elimina una sessione con partite e voti\n"
     "/delete_match <i>id_sessione</i> [<i>n° partita</i>] – elimina una partita e i suoi voti\n\n"
@@ -148,6 +150,7 @@ HELP_ALL = (
     "/ranking – classifica globale (aggiungi <i>txt</i> per averla solo come testo)\n"
     "/ranking_evento [<i>id o nome</i>] – classifica di un evento (default: quello in corso o l'ultimo)\n"
     "/ranking_sessione [<i>id</i>] – classifica di una sessione (default: l'ultima)\n"
+    "/ranking_txt, /ranking_evento_txt, /ranking_sessione_txt – come sopra, solo testo e senza tag @\n"
     "/impostazioni – in privato: scegli se essere taggato con la @ in classifica\n"
     "/mio_id – mostra il tuo ID Telegram"
 )
@@ -159,6 +162,11 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     arg = ctx.args[0] if ctx.args else ""
     if update.effective_chat.type == ChatType.PRIVATE and arg == "impostazioni":
         await cmd_settings(update, ctx)
+        return
+    if (update.effective_chat.type == ChatType.PRIVATE and arg.startswith("rp_") and arg[3:].isdigit()
+            and is_admin(update, ctx)):
+        ctx.args = [arg[3:]]
+        await cmd_match_result(update, ctx)
         return
     if update.effective_chat.type == ChatType.PRIVATE and arg.startswith("fb"):
         kind, _, rest = arg.partition("_")
@@ -294,10 +302,10 @@ async def cmd_sessions(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         lines = [f"<b>#{s.id}</b> {escape(s.name)} – {fmt_dt(s.starts_at, c.tz)}",
                  f"    {state} · risultati {done}/{len(matches)}{ev}"]
         for m in matches:
-            res = "" if m.winner is None else f" → {escape(_winner_text(m))}"
-            lines.append(f"    <code>{m.id}</code> · {m.position}. {escape(m.label())}{res}")
+            lines.append(f'    <a href="{_deep_link(ctx, f"rp_{m.id}")}">✏️{m.id}</a> {match_line(m)}')
         blocks.append("\n".join(lines))
-    blocks.append("ID partita a sinistra: per dare o correggere un risultato <code>/risultato_partita ID</code>")
+    blocks.append("Tocca ✏️ accanto a una partita per dare o correggere il risultato "
+                  "(oppure <code>/risultato_partita ID</code>).")
     for text in _chunks(blocks):
         await reply(update, text)
 
@@ -306,7 +314,7 @@ async def _matches_text(ctx: ContextTypes.DEFAULT_TYPE, s: Session) -> str:
     d = db(ctx)
     ev = await d.get_event(s.event_id) if s.event_id else None
     matches = await d.get_matches(s.id)
-    lines = "\n".join(f"{m.position}. {escape(m.label())}" for m in matches) or "Nessuna partita."
+    lines = "\n".join(match_line(m) for m in matches) or "Nessuna partita."
     return (f"🏆 {escape(ev.name) if ev else 'Nessun evento'}\n"
             f"📁 {escape(s.name)}\n"
             f"⏰ {fmt_dt(s.starts_at, cfg(ctx).tz)}\n\n{lines}")
@@ -718,8 +726,48 @@ def _result_keyboard(m: Match, mode: str) -> InlineKeyboardMarkup:
     ])
 
 
+def _split_flag(name: str) -> tuple[str, str]:
+    """'🏴 Gary Anderson' -> ('🏴', 'Gary Anderson'): la bandiera è la prima parola senza lettere/cifre."""
+    tok, _, rest = name.strip().partition(" ")
+    if rest and not any(ch.isalnum() for ch in tok):
+        return tok, rest.strip()
+    return "", name.strip()
+
+
+def match_line(m: Match) -> str:
+    """Riga di una partita per /partite e /sessioni (HTML).
+
+    ✓ 1. <b>Menzies</b> 🏴 <b>3</b> - 2 🇦🇹 Suljovic   (giocata: vincitore e suo punteggio in grassetto)
+    ⚠️ 1. Menzies 🏴 - 🇦🇹 Suljovic                    (da giocare)
+    """
+    f1, n1 = _split_flag(m.player1)
+    f2, n2 = _split_flag(m.player2)
+    n1, n2 = escape(n1), escape(n2)
+    if m.winner == 1:
+        n1 = f"<b>{n1}</b>"
+    elif m.winner == 2:
+        n2 = f"<b>{n2}</b>"
+    left = f"{n1} {f1}".strip()
+    right = f"{f2} {n2}".strip()
+    if m.winner in (1, 2) and m.score1 is not None and m.score2 is not None:
+        s1, s2 = str(m.score1), str(m.score2)
+        if m.winner == 1:
+            s1 = f"<b>{s1}</b>"
+        else:
+            s2 = f"<b>{s2}</b>"
+        mid = f" {s1} - {s2} "
+    else:
+        mid = " - "
+    icon = {None: "⚠️", 0: "🚫"}.get(m.winner, "✓")
+    tail = " (non disputata)" if m.winner == 0 else ""
+    return f"{icon} {m.position}. {left}{mid}{right}{tail}"
+
+
 def _winner_text(m: Match) -> str:
-    return {None: "—", 0: "non disputata", 1: m.player1, 2: m.player2}[m.winner]
+    name = {None: "—", 0: "non disputata", 1: m.player1, 2: m.player2}[m.winner]
+    if m.winner in (1, 2) and m.score1 is not None and m.score2 is not None:
+        name += f" ({m.score1}-{m.score2})"
+    return name
 
 
 async def _ask_next(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, session_id: int, mode: str,
@@ -747,9 +795,10 @@ async def _ask_next(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, session_id: in
                      f"hanno un risultato.\n\n{summary}", parse_mode=ParseMode.HTML, reply_markup=kb)
         return
     cur = "" if nxt.winner is None else f"\n(attuale: {escape(_winner_text(nxt))})"
-    await ctx.bot.send_message(
-        chat_id, f"Partita {nxt.position}/{len(matches)}\n<b>{escape(nxt.label())}</b>\n\nChi ha vinto?{cur}",
-        parse_mode=ParseMode.HTML, reply_markup=_result_keyboard(nxt, mode))
+    msg = await ctx.bot.send_message(
+        chat_id, f"Partita {nxt.position}/{len(matches)}\n<b>{escape(nxt.label())}</b>\n\nChi ha vinto?{cur}"
+                 f"{SCORE_HINT}", parse_mode=ParseMode.HTML, reply_markup=_result_keyboard(nxt, mode))
+    _await_score(ctx, nxt.id, mode, msg)
 
 
 async def cmd_results(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -787,8 +836,55 @@ async def cmd_match_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
         return
     s = await db(ctx).get_session(m.session_id)
     cur = "" if m.winner is None else f"\n(attuale: {escape(_winner_text(m))})"
-    await reply(update, f"📋 {escape(s.name) if s else ''} · partita {m.position}\n<b>{escape(m.label())}</b>\n\n"
-                        f"Chi ha vinto?{cur}", reply_markup=_result_keyboard(m, "s"))
+    msg = await reply(update, f"📋 {escape(s.name) if s else ''} · partita {m.position}\n<b>{escape(m.label())}</b>\n\n"
+                              f"Chi ha vinto?{cur}{SCORE_HINT}", reply_markup=_result_keyboard(m, "s"))
+    _await_score(ctx, m.id, "s", msg)
+
+
+SCORE_HINT = "\n\nTocca il vincitore, oppure scrivi il punteggio (es. <code>6-4</code>)."
+SCORE_RE = re.compile(r"^\s*(\d{1,2})\s*[-–:]\s*(\d{1,2})\s*$")
+
+
+def _await_score(ctx: ContextTypes.DEFAULT_TYPE, match_id: int, mode: str, msg) -> None:
+    """Ricorda la partita a cui l'admin può rispondere scrivendo il punteggio."""
+    ctx.user_data["score_for"] = {"match_id": match_id, "mode": mode,
+                                  "message_id": getattr(msg, "message_id", None)}
+
+
+async def on_score_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """In privato: '6-4' scritto dopo la domanda 'Chi ha vinto?' salva vincitore e punteggio."""
+    pending = ctx.user_data.get("score_for")
+    msg = update.effective_message
+    if not pending or not msg or not msg.text or not is_admin(update, ctx):
+        return
+    mt = SCORE_RE.match(msg.text)
+    if not mt:
+        return
+    s1, s2 = int(mt.group(1)), int(mt.group(2))
+    if s1 == s2:
+        await reply(update, "Pareggio non valido: scrivi il punteggio con un vincitore, es. <code>6-4</code>.")
+        return
+    d = db(ctx)
+    m = await d.get_match(pending["match_id"])
+    if m is None:
+        ctx.user_data.pop("score_for", None)
+        return
+    ctx.user_data.pop("score_for", None)
+    winner = 1 if s1 > s2 else 2
+    await d.set_winner(m.id, winner, s1, s2)
+    m.winner, m.score1, m.score2 = winner, s1, s2
+    done = f"✅ {m.position}. {escape(m.label())} → <b>{escape(_winner_text(m))}</b>"
+    chat_id = update.effective_chat.id
+    if pending.get("message_id"):
+        try:
+            await ctx.bot.edit_message_text(done, chat_id=chat_id, message_id=pending["message_id"],
+                                            parse_mode=ParseMode.HTML)
+        except TelegramError:
+            await reply(update, done)
+    else:
+        await reply(update, done)
+    if pending["mode"] != "s":
+        await _ask_next(ctx, chat_id, m.session_id, pending["mode"], m.position)
 
 
 async def cb_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -797,6 +893,8 @@ async def cb_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await q.answer("Solo admin", show_alert=True)
         return
     _, mode, match_id, value = q.data.split(":")
+    if (ctx.user_data.get("score_for") or {}).get("match_id") == int(match_id):
+        ctx.user_data.pop("score_for", None)
     d = db(ctx)
     m = await d.get_match(int(match_id))
     if m is None:
@@ -858,19 +956,21 @@ def pop_txt_flag(ctx: ContextTypes.DEFAULT_TYPE) -> bool:
 
 
 async def send_ranking(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, *, session: Session | None = None,
-                       event: Event | None = None, scope_chat: int | None = None, text_only: bool = False) -> None:
+                       event: Event | None = None, scope_chat: int | None = None, text_only: bool = False,
+                       tag: bool = True) -> None:
+    """tag=False: nomi senza @ (nessuna notifica), per le versioni _txt dei comandi."""
     c, d = cfg(ctx), db(ctx)
     if event:
-        rows = await d.ranking(event_id=event.id)
+        rows = await d.ranking(event_id=event.id, tag=tag)
         done, total = await d.results_progress(event_id=event.id)
         state = "in corso" if event.ended_at is None else "concluso"
         title, subtitle = "Classifica evento", f"{event.name} ({state}) · risultati {done}/{total}"
     elif session:
-        rows = await d.ranking(session_id=session.id)
+        rows = await d.ranking(session_id=session.id, tag=tag)
         done, total = await d.results_progress(session_id=session.id)
         title, subtitle = "Classifica sessione", f"{session.name} · risultati {done}/{total}"
     else:
-        rows = await d.ranking(chat_id=scope_chat)
+        rows = await d.ranking(chat_id=scope_chat, tag=tag)
         done, total = await d.results_progress(chat_id=scope_chat)
         title, subtitle = "Classifica globale", f"Tutti gli eventi · risultati {done}/{total}"
     pos = competition_positions([r.points for r in rows])
@@ -906,16 +1006,25 @@ async def send_ranking(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, *, session:
         await send_text()
 
 
+def _is_txt_command(update: Update) -> bool:
+    """/ranking_txt, /ranking_sessione_txt, /ranking_evento_txt: solo testo e nessun tag."""
+    text = (update.effective_message.text or "") if update.effective_message else ""
+    cmd = text.split(maxsplit=1)[0].split("@")[0].lower() if text else ""
+    return cmd.endswith("_txt")
+
+
 async def cmd_ranking(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
     # Nel gruppo: tutte le sessioni lanciate in quel gruppo. In privato: tutte le sessioni.
     scope = None if chat.type == ChatType.PRIVATE else chat.id
-    await send_ranking(ctx, chat.id, scope_chat=scope, text_only=pop_txt_flag(ctx))
+    notag = _is_txt_command(update)
+    await send_ranking(ctx, chat.id, scope_chat=scope, text_only=pop_txt_flag(ctx) or notag, tag=not notag)
 
 
 async def cmd_ranking_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
-    text_only = pop_txt_flag(ctx)
+    notag = _is_txt_command(update)
+    text_only = pop_txt_flag(ctx) or notag
     sid = parse_session_arg(ctx)
     d = db(ctx)
     if sid:
@@ -928,18 +1037,19 @@ async def cmd_ranking_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
     if not s:
         await reply(update, "Sessione non trovata. Uso: /ranking_sessione [<i>id</i>]")
         return
-    await send_ranking(ctx, chat.id, session=s, text_only=text_only)
+    await send_ranking(ctx, chat.id, session=s, text_only=text_only, tag=not notag)
 
 
 async def cmd_ranking_event(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     d = db(ctx)
-    text_only = pop_txt_flag(ctx)
+    notag = _is_txt_command(update)
+    text_only = pop_txt_flag(ctx) or notag
     ref = " ".join(ctx.args).strip()
     ev = await d.find_event(ref) if ref else await d.latest_event()
     if not ev:
         await reply(update, "Evento non trovato. Uso: /ranking_evento [<i>id o nome</i>]")
         return
-    await send_ranking(ctx, update.effective_chat.id, event=ev, text_only=text_only)
+    await send_ranking(ctx, update.effective_chat.id, event=ev, text_only=text_only, tag=not notag)
 
 
 # ---------------------------------------------------------------- eventi
@@ -1406,9 +1516,9 @@ def setup(app: Application) -> None:
     app.add_handler(CommandHandler("membri", cmd_members))
     app.add_handler(CommandHandler("risultati_sessione", cmd_results))
     app.add_handler(CommandHandler("risultato_partita", cmd_match_result))
-    app.add_handler(CommandHandler("ranking", cmd_ranking))
-    app.add_handler(CommandHandler("ranking_sessione", cmd_ranking_session))
-    app.add_handler(CommandHandler("ranking_evento", cmd_ranking_event))
+    app.add_handler(CommandHandler(["ranking", "ranking_txt"], cmd_ranking))
+    app.add_handler(CommandHandler(["ranking_sessione", "ranking_sessione_txt"], cmd_ranking_session))
+    app.add_handler(CommandHandler(["ranking_evento", "ranking_evento_txt"], cmd_ranking_event))
     app.add_handler(CommandHandler("start_event", cmd_start_event))
     app.add_handler(CommandHandler("end_event", cmd_end_event))
     app.add_handler(CommandHandler("eventi", cmd_events))
@@ -1420,6 +1530,7 @@ def setup(app: Application) -> None:
     app.add_handler(PollAnswerHandler(on_poll_answer))
     app.add_handler(ChatMemberHandler(on_chat_member, ChatMemberHandler.CHAT_MEMBER))
     # gruppo separato: registra chi scrive anche quando un comando ha già gestito il messaggio
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, on_score_text))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS, on_group_message), group=1)
     app.add_error_handler(on_error)
     app.job_queue.run_repeating(close_due_polls, interval=30, first=5, name="close_due_polls")
@@ -1446,6 +1557,9 @@ BOT_COMMANDS_GROUP = [
     ("ranking", "Classifica globale"),
     ("ranking_evento", "Classifica dell'evento in corso"),
     ("ranking_sessione", "Classifica dell'ultima sessione"),
+    ("ranking_txt", "Classifica globale in testo, senza tag"),
+    ("ranking_evento_txt", "Classifica evento in testo, senza tag"),
+    ("ranking_sessione_txt", "Classifica sessione in testo, senza tag"),
 ]
 
 __all__ = ["setup", "BOT_COMMANDS_PRIVATE", "BOT_COMMANDS_GROUP"]

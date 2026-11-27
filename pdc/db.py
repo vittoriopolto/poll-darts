@@ -21,6 +21,8 @@ class Match:
     poll_id: str | None
     poll_message_id: int | None
     winner: int | None
+    score1: int | None = None
+    score2: int | None = None
 
     def label(self) -> str:
         return f"{self.player1} - {self.player2}"
@@ -304,13 +306,13 @@ class DB:
 
     async def get_matches(self, session_id: int) -> list[Match]:
         rows = await self.pool.fetch(
-            "SELECT id, session_id, position, player1, player2, poll_id, poll_message_id, winner "
+            "SELECT id, session_id, position, player1, player2, poll_id, poll_message_id, winner, score1, score2 "
             "FROM matches WHERE session_id = $1 ORDER BY position", session_id)
         return [Match(**dict(r)) for r in rows]
 
     async def get_match(self, match_id: int) -> Match | None:
         row = await self.pool.fetchrow(
-            "SELECT id, session_id, position, player1, player2, poll_id, poll_message_id, winner "
+            "SELECT id, session_id, position, player1, player2, poll_id, poll_message_id, winner, score1, score2 "
             "FROM matches WHERE id = $1", match_id)
         return Match(**dict(row)) if row else None
 
@@ -322,8 +324,11 @@ class DB:
         return await self.pool.fetchval(
             "SELECT count(*) FROM votes v JOIN matches m ON m.id = v.match_id WHERE m.session_id = $1", session_id)
 
-    async def set_winner(self, match_id: int, winner: int | None) -> None:
-        await self.pool.execute("UPDATE matches SET winner = $2 WHERE id = $1", match_id, winner)
+    async def set_winner(self, match_id: int, winner: int | None,
+                         score1: int | None = None, score2: int | None = None) -> None:
+        """Salva il vincitore; il punteggio è facoltativo (senza, viene cancellato quello vecchio)."""
+        await self.pool.execute("UPDATE matches SET winner = $2, score1 = $3, score2 = $4 WHERE id = $1",
+                                match_id, winner, score1, score2)
 
     # ---------- voti ----------
 
@@ -360,7 +365,7 @@ class DB:
 
     # ---------- classifica ----------
 
-    async def ranking(self, *, session_id: int | None = None, chat_id: int | None = None,
+    async def ranking(self, *, session_id: int | None = None, chat_id: int | None = None, tag: bool = True,
                       event_id: int | None = None) -> list[RankRow]:
         """Classifica: +1 per ogni voto uguale al vincitore.
 
@@ -380,7 +385,8 @@ class DB:
                GROUP BY u.user_id
                ORDER BY points DESC, lower(COALESCE(u.username, u.first_name, ''))""",
             session_id, chat_id, event_id)
-        return [RankRow(r["user_id"], display_name(r["username"], r["first_name"], r["last_name"], r["tag_enabled"]),
+        return [RankRow(r["user_id"], display_name(r["username"], r["first_name"], r["last_name"],
+                                                   tag and r["tag_enabled"]),
                         r["points"], r["answered"]) for r in rows]
 
     async def results_progress(self, *, session_id: int | None = None, chat_id: int | None = None,
