@@ -12,7 +12,7 @@ from html import escape
 
 from telegram import (ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update)
 from telegram.constants import ChatMemberStatus, ChatType, ParseMode
-from telegram.error import BadRequest, Forbidden, TelegramError
+from telegram.error import BadRequest, Forbidden, TelegramError, TimedOut
 from telegram.ext import (Application, CallbackQueryHandler, ChatMemberHandler, CommandHandler,
                           ContextTypes, ConversationHandler, MessageHandler, PollAnswerHandler, filters)
 
@@ -24,6 +24,9 @@ from .db import DB, Event, Match, Session
 from .parsing import ParseError, competition_positions, fmt_dt, parse_matches, parse_start
 
 log = logging.getLogger(__name__)
+
+# Secondi di attesa per ogni send_poll (default della libreria: 5): evita i "Timed out" quando Telegram è lento.
+POLL_TIMEOUT = 30
 
 # Utente fittizio con cui Telegram mostra gli admin anonimi nei gruppi.
 GROUP_ANONYMOUS_BOT = 1087968824
@@ -150,6 +153,7 @@ HELP_ADMIN = (
     "/consigli [<i>id</i>] – nel gruppo: invito con il bottone per rispondere (default: l'ultimo)\n\n"
     "<b>Comandi admin (nel gruppo)</b>\n"
     "/lancia_sondaggi <i>id</i> – muta il gruppo, pubblica copertina e sondaggi\n"
+    "/lancia_sondaggi <i>id</i> mancanti – pubblica solo i sondaggi non andati a buon fine (es. Timed out)\n"
     "/muta, /smuta – muta/smuta il gruppo a mano\n\n"
     "<b>Classifiche (admin)</b>\n"
     "Ogni /ranking… lanciato da admin chiede: immagine sì/no, tag sì/no. In privato mostra "
@@ -822,10 +826,16 @@ async def cmd_launch(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not s:
         await reply(update, "Uso: /lancia_sondaggi <i>id_sessione</i>")
         return
-    force = len(ctx.args) > 1 and ctx.args[1].lower() == "forza"
-    if s.launched_at and not force:
-        await reply(update, f"La sessione #{sid} è già stata lanciata. "
-                            f"Per rilanciarla comunque: <code>/lancia_sondaggi {sid} forza</code>")
+    mode = ctx.args[1].lower() if len(ctx.args) > 1 else ""
+    force, missing_only = mode == "forza", mode == "mancanti"
+    if missing_only and not s.launched_at:
+        await reply(update, f"La sessione #{sid} non è ancora stata lanciata: "
+                            f"usa <code>/lancia_sondaggi {sid}</code>")
+        return
+    if s.launched_at and not (force or missing_only):
+        await reply(update, f"La sessione #{sid} è già stata lanciata.\n"
+                            f"Solo i sondaggi non pubblicati: <code>/lancia_sondaggi {sid} mancanti</code>\n"
+                            f"Tutto da capo: <code>/lancia_sondaggi {sid} forza</code>")
         return
     closes = close_time(s, c)
     seconds_left = (closes - now_utc()).total_seconds()
@@ -834,6 +844,11 @@ async def cmd_launch(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                             f"{fmt_dt(closes, c.tz)}: troppo tardi per lanciarli.")
         return
     matches = await d.get_matches(sid)
+    if missing_only:
+        matches = [m for m in matches if not m.poll_id]
+        if not matches:
+            await reply(update, f"Sessione #{sid}: tutti i sondaggi risultano già pubblicati. ✅")
+            return
 
     # Il comando stesso sparisce (serve il permesso di cancellare, altrimenti pazienza).
     try:
@@ -841,28 +856,30 @@ async def cmd_launch(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     except TelegramError:
         pass
 
-    prev_perms, mute_err = await mute_group(ctx.bot, chat.id)
-    if prev_perms:
-        await d.save_permissions(sid, prev_perms)
-    await d.mark_launched(sid, chat.id)
+    prev_perms = mute_err = None
+    if not missing_only:  # per pochi sondaggi mancanti non si muta (e non si toccano i permessi salvati)
+        prev_perms, mute_err = await mute_group(ctx.bot, chat.id)
+        if prev_perms:
+            await d.save_permissions(sid, prev_perms)
+        await d.mark_launched(sid, chat.id)
 
-    event = await d.get_event(s.event_id) if s.event_id else None
-    lines = ([event.name] if event else []) + [f"Inizio: {fmt_dt(s.starts_at, c.tz)}",
-             f"Voti aperti fino alle {closes.astimezone(c.tz):%H:%M}",
-             f"{len(matches)} partite · chi vince?"]
-    # Niente comandi nel messaggio: nel gruppo la gente ci cliccherebbe sopra.
-    caption = (f"🎯 <b>{escape(c.cover_title)}</b> – {escape(s.name)}"
-               + (f" · {escape(event.name)}" if event else "") + "\n\n"
-               f"Vota il vincitore di ogni partita qui sotto: ogni pronostico giusto vale <b>+1 punto</b>.\n"
-               f"I sondaggi si chiudono alle <b>{closes.astimezone(c.tz):%H:%M}</b>.")
-    try:
-        await ctx.bot.send_photo(chat.id, images.cover_image(c.cover_title, s.name, lines),
-                                 caption=caption, parse_mode=ParseMode.HTML)
-    except TelegramError as e:
-        log.warning("copertina non inviata: %s", e)
-        await ctx.bot.send_message(chat.id, caption, parse_mode=ParseMode.HTML)
+        event = await d.get_event(s.event_id) if s.event_id else None
+        lines = ([event.name] if event else []) + [f"Inizio: {fmt_dt(s.starts_at, c.tz)}",
+                 f"Voti aperti fino alle {closes.astimezone(c.tz):%H:%M}",
+                 f"{len(matches)} partite · chi vince?"]
+        # Niente comandi nel messaggio: nel gruppo la gente ci cliccherebbe sopra.
+        caption = (f"🎯 <b>{escape(c.cover_title)}</b> – {escape(s.name)}"
+                   + (f" · {escape(event.name)}" if event else "") + "\n\n"
+                   f"Vota il vincitore di ogni partita qui sotto: ogni pronostico giusto vale <b>+1 punto</b>.\n"
+                   f"I sondaggi si chiudono alle <b>{closes.astimezone(c.tz):%H:%M}</b>.")
+        try:
+            await ctx.bot.send_photo(chat.id, images.cover_image(c.cover_title, s.name, lines),
+                                     caption=caption, parse_mode=ParseMode.HTML)
+        except TelegramError as e:
+            log.warning("copertina non inviata: %s", e)
+            await ctx.bot.send_message(chat.id, caption, parse_mode=ParseMode.HTML)
 
-    failed = []
+    failed, timed_out = [], False
     for m in matches:
         kw = {}
         # Telegram accetta close_date solo tra 5 e 600 secondi nel futuro: oltre ci pensa il job.
@@ -876,11 +893,15 @@ async def cmd_launch(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 options=[m.player1, m.player2],
                 is_anonymous=False,           # indispensabile per sapere CHI ha votato
                 allows_multiple_answers=False,
+                read_timeout=POLL_TIMEOUT, write_timeout=POLL_TIMEOUT, connect_timeout=POLL_TIMEOUT,
                 **kw,
             )
             await d.set_poll(m.id, msg.poll.id, msg.message_id)
         except TelegramError as e:
+            # Niente nuovo tentativo automatico: con un timeout il sondaggio può essere comparso
+            # lo stesso, e riprovare lo duplicherebbe.
             log.exception("send_poll fallito")
+            timed_out = timed_out or isinstance(e, TimedOut)
             failed.append(f"#{m.position} {m.label()}: {e}")
 
     if c.mute_mode != "chiusura" and prev_perms is not None:
@@ -889,12 +910,20 @@ async def cmd_launch(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             mute_err = f"smute fallito: {err}"
 
     # Report privato all'admin che ha lanciato
-    report = [f"✅ Sessione #{sid} lanciata: {len(matches) - len(failed)}/{len(matches)} sondaggi pubblicati.",
+    what = "sondaggi mancanti" if missing_only else "sondaggi"
+    report = [f"✅ Sessione #{sid}: {len(matches) - len(failed)}/{len(matches)} {what} pubblicati.",
               f"Chiusura automatica alle {fmt_dt(closes, c.tz)}."]
     if mute_err:
         report.append(f"⚠️ Mute: {mute_err}\n(Il bot deve essere admin con il permesso 'Limitare utenti'.)")
     if failed:
         report.append("⚠️ Errori:\n" + "\n".join(failed))
+        fix = []
+        if timed_out:
+            fix.append("«Timed out» = Telegram non ha risposto in tempo: il sondaggio potrebbe essere "
+                       "comparso lo stesso nel gruppo, ma il bot non lo conosce e i suoi voti NON verrebbero "
+                       "contati. Se lo vedi nel gruppo, cancellalo.")
+        fix.append(f"Poi, nel gruppo, ripubblica solo quelli mancanti: /lancia_sondaggi {sid} mancanti")
+        report.append("\n" + "\n".join(fix))
     try:
         await ctx.bot.send_message(update.effective_user.id, "\n".join(report))
     except (Forbidden, BadRequest):  # admin anonimo o chat privata mai aperta col bot

@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 from telegram import ChatPermissions
+from telegram.error import TimedOut
 
 from pdc import handlers as h
 from pdc.config import Config
@@ -188,7 +189,35 @@ async def scenario():
     # rilancio bloccato
     upd, rep = make_update(chat_id=GROUP, chat_type="supergroup")
     await h.cmd_launch(upd, make_ctx(bot, cfg, database, ["1"]))
-    assert "già stata lanciata" in rep[0]
+    assert "già stata lanciata" in rep[0] and "/lancia_sondaggi 1 mancanti" in rep[0]
+
+    # sondaggio andato in timeout (non salvato): "mancanti" ripubblica solo quello, senza copertina né mute
+    first = (await database.get_matches(1))[0]
+    async with database.pool.acquire() as conn:
+        await conn.execute("UPDATE matches SET poll_id = NULL, poll_message_id = NULL WHERE id = $1", first.id)
+    real_send_poll = bot.send_poll
+
+    async def timing_out(*a, **kw):
+        raise TimedOut()
+    bot.send_poll = timing_out
+    n = len(bot.calls)
+    upd, rep = make_update(chat_id=GROUP, chat_type="supergroup")
+    await h.cmd_launch(upd, make_ctx(bot, cfg, database, ["1", "mancanti"]))
+    report = bot.calls[-1][1][1]
+    assert "0/1 sondaggi mancanti" in report and "cancellalo" in report and "/lancia_sondaggi 1 mancanti" in report
+    bot.send_poll = real_send_poll
+    n = len(bot.calls)
+    upd, rep = make_update(chat_id=GROUP, chat_type="supergroup")
+    await h.cmd_launch(upd, make_ctx(bot, cfg, database, ["1", "mancanti"]))
+    assert [c[0] for c in bot.calls[n:]] == ["poll", "msg"], bot.calls[n:]
+    assert bot.calls[n][1][1] == "Rossi - Bianchi"
+    assert "1/1 sondaggi mancanti" in bot.calls[n + 1][1][1]
+    assert all(m.poll_id for m in await database.get_matches(1))
+    # niente più da ripubblicare
+    upd, rep = make_update(chat_id=GROUP, chat_type="supergroup")
+    await h.cmd_launch(upd, make_ctx(bot, cfg, database, ["1", "mancanti"]))
+    assert "già pubblicati" in rep[0]
+    await database.set_poll(first.id, first.poll_id, first.poll_message_id)  # i voti sotto usano gli id originali
 
     # --- /partite dopo il lancio: in privato bottone per mandarle nel gruppo
     markups = []
