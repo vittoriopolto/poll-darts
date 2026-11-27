@@ -16,6 +16,7 @@ Stack: Python 3.12 · python-telegram-bot 22 · Postgres (Neon) · deploy su Ren
 | privato (admin) | `/sessione_evento ID_SESSIONE ID_EVENTO` | sposta una sessione in un altro evento (`nessuno` per toglierla) |
 | privato (admin) | `/crea_sessione` | chiede nome, partite (`GIOCATORE 1 - GIOCATORE 2`, una per riga) e orario di inizio; salva e restituisce l'**ID sessione** |
 | gruppo (admin) | `/lancia_sondaggi ID` | muta il gruppo, pubblica la copertina "PDC180 POLL" e un sondaggio per partita, poi riapre il gruppo |
+| gruppo (admin) | `/lancia_sondaggi ID mancanti` | pubblica solo i sondaggi che non sono andati a buon fine (es. *Timed out*), senza copertina e senza mutare. Prima cancella dal gruppo l'eventuale sondaggio comparso comunque: il bot non lo conosce e i suoi voti non verrebbero contati |
 | — | (automatico) | i sondaggi si chiudono **5 minuti prima** dell'inizio sessione |
 | privato (admin) | `/risultati_sessione ID` | per ogni partita senza risultato: bottoni *Giocatore 1* / *Giocatore 2* / *Non disputata* / *Sessione non conclusa*. Rilanciandolo riprende da dove mancava |
 | privato (admin) | `/risultati_sessione ID tutte` | ripassa tutte le partite per correggere un risultato |
