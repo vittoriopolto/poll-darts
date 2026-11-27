@@ -45,3 +45,10 @@ def test_build_rounds_and_image():
     assert bracket.round_names(6) == ["1° TURNO", "2° TURNO", "OTTAVI", "QUARTI", "SEMIFINALI", "FINALE"]
     png = images.bracket_image("Players Championship Finals", "TABELLONE", rounds, bracket.round_names(3), "x")
     assert png[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_special_letters_match():
+    _, players = bracket.parse_draw("Sebastian Białecki POL - Gerwyn Price WAL\nA - B")
+    ms = [NS(player1="🇵🇱 Bialecki", player2="Price", winner=1, score1=6, score2=4)]
+    rounds = bracket.build_rounds(players, ms)
+    assert (rounds[0][0].winner, rounds[0][0].s1) == (1, 6)
