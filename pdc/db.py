@@ -1,6 +1,7 @@
 """Accesso al database Postgres (Neon) con asyncpg."""
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -303,6 +304,25 @@ class DB:
             "WHERE launched_at IS NOT NULL AND closed_at IS NULL AND starts_at - $2::interval <= $1",
             now, self.close_delta)
         return [Session(**dict(r)) for r in rows]
+
+    # ---------- tabellone ----------
+
+    async def save_bracket(self, event_id: int, title: str | None, draw: list) -> None:
+        await self.pool.execute(
+            "INSERT INTO brackets (event_id, title, draw) VALUES ($1, $2, $3::jsonb) "
+            "ON CONFLICT (event_id) DO UPDATE SET title = $2, draw = $3::jsonb, updated_at = now()",
+            event_id, title, json.dumps(draw))
+
+    async def get_bracket(self, event_id: int) -> tuple[str | None, list] | None:
+        row = await self.pool.fetchrow("SELECT title, draw FROM brackets WHERE event_id = $1", event_id)
+        return (row["title"], json.loads(row["draw"])) if row else None
+
+    async def event_matches(self, event_id: int) -> list[Match]:
+        rows = await self.pool.fetch(
+            "SELECT m.id, m.session_id, m.position, m.player1, m.player2, m.poll_id, m.poll_message_id, m.winner, "
+            "m.score1, m.score2 FROM matches m JOIN sessions s ON s.id = m.session_id "
+            "WHERE s.event_id = $1 ORDER BY s.starts_at, m.position", event_id)
+        return [Match(**dict(r)) for r in rows]
 
     # ---------- partite ----------
 

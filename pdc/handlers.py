@@ -1,6 +1,7 @@
 """Comandi e gestori del bot."""
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import json
 import re
@@ -17,7 +18,7 @@ from telegram.ext import (Application, CallbackQueryHandler, ChatMemberHandler, 
 
 from telegram.warnings import PTBUserWarning
 
-from . import images, livescore
+from . import bracket, images, livescore
 from .config import Config
 from .db import DB, Event, Match, Session
 from .parsing import ParseError, competition_positions, fmt_dt, parse_matches, parse_start
@@ -28,6 +29,7 @@ log = logging.getLogger(__name__)
 GROUP_ANONYMOUS_BOT = 1087968824
 
 ASK_NAME, ASK_MATCHES, ASK_START, ASK_CONFIRM = range(4)
+BR_DRAW = 20
 
 
 # ---------------------------------------------------------------- utilità
@@ -129,7 +131,9 @@ HELP_ADMIN = (
     "<b>Comandi admin (in privato)</b>\n"
     "/crea_sessione – crea una sessione (nome, partite, orario)\n"
     "/sessioni – ultime sessioni con le partite e i loro ID\n"
-    "/partite <i>id</i> – elenco partite in testo; in privato chiede se mandarlo nel gruppo\n"
+    "/partite <i>id</i> – elenco partite in testo; in privato chiede se aggiornare il tabellone e se mandarlo nel gruppo\n"
+    "/tabellone_imposta [<i>evento</i>] – incolla gli accoppiamenti del 1° turno (tabellone dell'evento)\n"
+    "/tabellone [<i>evento</i>] – immagine del tabellone con i risultati salvati\n"
     "/risultati_sessione <i>id</i> – inserisci i vincitori (riprende da dove eri rimasto)\n"
     "/risultati_sessione <i>id</i> tutte – rivedi/correggi tutti i risultati\n"
     "/risultato_partita <i>id_partita</i> – dai/correggi il risultato di una sola partita (o tocca ✏️ in /sessioni)\n"
@@ -364,9 +368,54 @@ async def cmd_matches(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if await _matches_target_group(ctx, s) is None:
         await reply(update, "Nessun gruppo conosciuto: lancia <code>/partite</code> direttamente nel gruppo.")
         return
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("📣 Sì, manda nel gruppo", callback_data=f"ptg:{s.id}"),
-                                InlineKeyboardButton("No", callback_data="ptg:no")]])
-    await reply(update, "Le mando nel gruppo?", reply_markup=kb)
+    if s.event_id and await db(ctx).get_bracket(s.event_id):
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🏆 Sì, aggiorna", callback_data=f"ptb:{s.id}:y"),
+                                    InlineKeyboardButton("No", callback_data=f"ptb:{s.id}:n")]])
+        await reply(update, "Aggiorno il tabellone?", reply_markup=kb)
+        return
+    await reply(update, "Le mando nel gruppo?", reply_markup=_matches_group_kb(s.id, False))
+
+
+def _matches_group_kb(session_id: int, with_bracket: bool) -> InlineKeyboardMarkup:
+    if not with_bracket:
+        return InlineKeyboardMarkup([[InlineKeyboardButton("📣 Sì, manda nel gruppo", callback_data=f"ptg:{session_id}"),
+                                      InlineKeyboardButton("No", callback_data="ptg:no")]])
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📣 Elenco + tabellone", callback_data=f"ptg:{session_id}:lb")],
+        [InlineKeyboardButton("📋 Solo elenco", callback_data=f"ptg:{session_id}:l"),
+         InlineKeyboardButton("🏆 Solo tabellone", callback_data=f"ptg:{session_id}:b")],
+        [InlineKeyboardButton("No", callback_data="ptg:no")],
+    ])
+
+
+async def cb_matches_bracket(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Dopo /partite in privato: "Aggiorno il tabellone?" sì -> anteprima immagine; poi chiede se mandare nel gruppo."""
+    q = update.callback_query
+    if not is_admin(update, ctx):
+        await q.answer("Solo admin", show_alert=True)
+        return
+    _, sid, ans = q.data.split(":")
+    s = await db(ctx).get_session(int(sid))
+    if not s:
+        await q.answer()
+        await q.edit_message_text("Sessione non trovata.")
+        return
+    chat_id = q.message.chat.id
+    with_bracket = False
+    if ans == "y":
+        await q.answer("Preparo il tabellone…")
+        await q.edit_message_text("🏆 Tabellone aggiornato:")
+        made = await _bracket_png(ctx, s.event_id) if s.event_id else None
+        if made:
+            png, caption = made
+            await ctx.bot.send_photo(chat_id, png, caption=caption, parse_mode=ParseMode.HTML)
+            with_bracket = True
+        else:
+            await ctx.bot.send_message(chat_id, "Nessun tabellone per questo evento (vedi /tabellone_imposta).")
+    else:
+        await q.answer()
+        await q.edit_message_text("Ok, tabellone non aggiornato.")
+    await ctx.bot.send_message(chat_id, "Le mando nel gruppo?", reply_markup=_matches_group_kb(s.id, with_bracket))
 
 
 async def cb_matches_to_group(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -374,7 +423,9 @@ async def cb_matches_to_group(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
     if not is_admin(update, ctx):
         await q.answer("Solo admin", show_alert=True)
         return
-    arg = q.data.split(":")[1]
+    parts = q.data.split(":")
+    arg = parts[1]
+    what = parts[2] if len(parts) > 2 else "l"  # l = elenco, b = tabellone, lb = tutti e due
     s = await db(ctx).get_session(int(arg)) if arg.isdigit() else None
     if not s:
         await q.answer()
@@ -385,14 +436,176 @@ async def cb_matches_to_group(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
         await q.answer("Nessun gruppo conosciuto", show_alert=True)
         return
     await q.answer("Mando…")
+    sent = []
     try:
-        await ctx.bot.send_message(group, await _matches_text(ctx, s), parse_mode=ParseMode.HTML,
-                                   disable_web_page_preview=True)
+        if "l" in what:
+            await ctx.bot.send_message(group, await _matches_text(ctx, s), parse_mode=ParseMode.HTML,
+                                       disable_web_page_preview=True)
+            sent.append("Elenco partite")
+        if "b" in what and s.event_id:
+            made = await _bracket_png(ctx, s.event_id)
+            if made:
+                await ctx.bot.send_photo(group, made[0], caption=made[1], parse_mode=ParseMode.HTML)
+                sent.append("tabellone" if sent else "Tabellone")
     except TelegramError as e:
-        log.warning("elenco partite non inviato al gruppo %s: %s", group, e)
+        log.warning("elenco partite/tabellone non inviato al gruppo %s: %s", group, e)
         await q.edit_message_text("⚠️ Non sono riuscito a mandarle nel gruppo.")
         return
-    await q.edit_message_text("📣 Elenco partite mandato nel gruppo.")
+    await q.edit_message_text(f"📣 {' e '.join(sent) or 'Niente'} mandato nel gruppo.")
+
+
+# ---------------------------------------------------------------- tabellone
+
+async def _bracket_png(ctx: ContextTypes.DEFAULT_TYPE, event_id: int) -> tuple[bytes, str] | None:
+    """Immagine del tabellone dell'evento con i risultati salvati, e la didascalia. None se non c'è tabellone."""
+    d = db(ctx)
+    saved = await d.get_bracket(event_id)
+    if not saved:
+        return None
+    title, draw = saved
+    ev = await d.get_event(event_id)
+    players = [bracket.Player.from_json(p) for p in draw]
+    rounds = bracket.build_rounds(players, await d.event_matches(event_id))
+    done, total = bracket.progress(rounds)
+    ev_name = ev.name if ev else ""
+    title = title or ev_name or "Tabellone"
+    subtitle = f"TABELLONE · {ev_name}" if ev_name and ev_name.casefold() != title.casefold() else "TABELLONE"
+    updated = f"aggiornato {datetime.now(cfg(ctx).tz):%d/%m %H:%M} · risultati {done}/{total}"
+    png = await asyncio.to_thread(images.bracket_image, title, subtitle, rounds,
+                                  bracket.round_names(len(rounds)), updated)
+    return png, f"🏆 <b>{escape(title)}</b> · tabellone ({done}/{total} risultati)"
+
+
+async def _bracket_event(ctx: ContextTypes.DEFAULT_TYPE, ref: str) -> Event | None:
+    d = db(ctx)
+    if ref:
+        return await d.find_event(ref)
+    return await d.active_event() or await d.latest_event()
+
+
+def _command_body(update: Update) -> tuple[str, str]:
+    """'/tabellone_imposta 3\nriga1\nriga2' -> ('3', 'riga1\nriga2')."""
+    text = (update.effective_message.text or "")
+    first, _, rest = text.partition("\n")
+    arg = first.split(maxsplit=1)[1].strip() if len(first.split(maxsplit=1)) > 1 else ""
+    return arg, rest.strip()
+
+
+DRAW_HELP = ("Incolla le partite del <b>1° turno</b> nell'ordine del tabellone (dall'alto in basso), una per riga:\n"
+             "<code>1 Wessel Nijman NED - 64 Henry Coates ENG</code>\n"
+             "Testa di serie e nazione (sigla o bandiera 🇳🇱) sono facoltative: va bene anche "
+             "<code>Nijman - Coates</code>.\n"
+             "Facoltativa una prima riga <code>Titolo: Players Championship Finals</code> "
+             "(altrimenti uso il nome dell'evento).\n"
+             "Servono 2, 4, 8, 16, 32 o 64 partite. I risultati li prendo dalle partite delle sessioni dell'evento, "
+             "abbinandole per nome.")
+
+
+async def bracket_set_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    if not _private_admin(update, ctx):
+        return ConversationHandler.END
+    arg, body = _command_body(update)
+    ev = await _bracket_event(ctx, arg)
+    if not ev:
+        await reply(update, "Nessun evento trovato: apri un evento con /start_event (o indica ID o nome).")
+        return ConversationHandler.END
+    ctx.user_data["bracket_event"] = ev.id
+    if body:
+        return await _bracket_save(update, ctx, body)
+    await reply(update, f"🏆 Tabellone dell'evento <b>#{ev.id} {escape(ev.name)}</b>.\n\n{DRAW_HELP}\n\n/annulla per uscire.")
+    return BR_DRAW
+
+
+async def bracket_set_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _bracket_save(update, ctx, update.message.text)
+
+
+async def _bracket_save(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str) -> int:
+    try:
+        title, players = bracket.parse_draw(text)
+    except ParseError as e:
+        await reply(update, f"⚠️ {escape(str(e))}\n\nRimanda l'elenco completo (o /annulla).")
+        return BR_DRAW
+    eid = ctx.user_data.pop("bracket_event", None)
+    if eid is None:
+        return ConversationHandler.END
+    await db(ctx).save_bracket(eid, title, [p.to_json() for p in players])
+    await reply(update, f"✅ Tabellone salvato: {len(players) // 2} partite del 1° turno. Ecco l'anteprima:")
+    await _send_bracket_preview(ctx, update.effective_chat.id, eid)
+    return ConversationHandler.END
+
+
+async def bracket_set_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    ctx.user_data.pop("bracket_event", None)
+    await reply(update, "Ok, tabellone non salvato.")
+    return ConversationHandler.END
+
+
+async def _send_bracket_preview(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, event_id: int) -> None:
+    made = await _bracket_png(ctx, event_id)
+    if not made:
+        await ctx.bot.send_message(chat_id, "Nessun tabellone per questo evento: crealo con /tabellone_imposta.")
+        return
+    await ctx.bot.send_photo(chat_id, made[0], caption=made[1], parse_mode=ParseMode.HTML)
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("📣 Sì, manda nel gruppo", callback_data=f"tbg:{event_id}"),
+                                InlineKeyboardButton("No", callback_data="tbg:no")]])
+    await ctx.bot.send_message(chat_id, "Lo mando nel gruppo?", reply_markup=kb)
+
+
+async def cmd_bracket(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """/tabellone [evento]: in privato anteprima + bottone per il gruppo; nel gruppo lo pubblica subito."""
+    if not is_admin(update, ctx):
+        return
+    chat = update.effective_chat
+    ev = await _bracket_event(ctx, " ".join(ctx.args))
+    if not ev:
+        await reply(update, "Nessun evento trovato.")
+        return
+    if chat.type == ChatType.PRIVATE:
+        await _send_bracket_preview(ctx, chat.id, ev.id)
+        return
+    try:
+        await update.effective_message.delete()
+    except TelegramError:
+        pass
+    made = await _bracket_png(ctx, ev.id)
+    if made:
+        await ctx.bot.send_photo(chat.id, made[0], caption=made[1], parse_mode=ParseMode.HTML)
+
+
+async def cb_bracket_to_group(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not is_admin(update, ctx):
+        await q.answer("Solo admin", show_alert=True)
+        return
+    arg = q.data.split(":")[1]
+    if not arg.isdigit():
+        await q.answer()
+        await q.edit_message_text("Ok, non lo mando.")
+        return
+    eid = int(arg)
+    d = db(ctx)
+    sids = await d.event_session_ids(eid)
+    group = None
+    for sid in reversed(sids):
+        s = await d.get_session(sid)
+        if s and s.chat_id:
+            group = s.chat_id
+            break
+    group = group or await d.last_group_chat()
+    if group is None:
+        await q.answer("Nessun gruppo conosciuto", show_alert=True)
+        return
+    await q.answer("Mando…")
+    made = await _bracket_png(ctx, eid)
+    try:
+        if made:
+            await ctx.bot.send_photo(group, made[0], caption=made[1], parse_mode=ParseMode.HTML)
+    except TelegramError as e:
+        log.warning("tabellone non inviato al gruppo %s: %s", group, e)
+        await q.edit_message_text("⚠️ Non sono riuscito a mandarlo nel gruppo.")
+        return
+    await q.edit_message_text("📣 Tabellone mandato nel gruppo.")
 
 
 def _private_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -1893,6 +2106,16 @@ def setup(app: Application) -> None:
         conversation_timeout=timedelta(minutes=30),
     )
     app.add_handler(fb_conv)
+    br_conv = ConversationHandler(
+        entry_points=[CommandHandler("tabellone_imposta", bracket_set_start, filters=private)],
+        states={BR_DRAW: [MessageHandler(filters.TEXT & ~filters.COMMAND, bracket_set_text)]},
+        fallbacks=[CommandHandler("annulla", bracket_set_cancel)],
+        conversation_timeout=timedelta(minutes=30),
+    )
+    app.add_handler(br_conv)
+    app.add_handler(CommandHandler("tabellone", cmd_bracket))
+    app.add_handler(CallbackQueryHandler(cb_bracket_to_group, pattern=r"^tbg:"))
+    app.add_handler(CallbackQueryHandler(cb_matches_bracket, pattern=r"^ptb:"))
     app.add_handler(CommandHandler("consigli", cmd_consigli))
     app.add_handler(CommandHandler("risultati_feedback", cmd_feedback_results))
     app.add_handler(CallbackQueryHandler(cb_feedback_answer, pattern=r"^fba:"))
@@ -1946,6 +2169,8 @@ BOT_COMMANDS_PRIVATE = [
     ("crea_sessione", "Crea una sessione di sondaggi"),
     ("sessioni", "Elenco sessioni"),
     ("partite", "Elenco partite di una sessione: /partite id"),
+    ("tabellone", "Immagine del tabellone dell'evento"),
+    ("tabellone_imposta", "Accoppiamenti del 1° turno del tabellone"),
     ("risultati_sessione", "Inserisci i risultati: /risultati_sessione id"),
     ("risultato_partita", "Risultato di una partita: /risultato_partita id"),
     ("ranking", "Classifica globale"),
