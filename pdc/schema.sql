@@ -98,3 +98,7 @@ CREATE TABLE IF NOT EXISTS feedback_answers (
 
 -- Aggiunto dopo: l'utente può scegliere (/impostazioni) di non essere taggato con la @.
 ALTER TABLE users ADD COLUMN IF NOT EXISTS tag_enabled BOOLEAN NOT NULL DEFAULT TRUE;
+
+-- Aggiunto dopo: punteggio della partita (facoltativo, es. 6-4), oltre al vincitore.
+ALTER TABLE matches ADD COLUMN IF NOT EXISTS score1 SMALLINT;
+ALTER TABLE matches ADD COLUMN IF NOT EXISTS score2 SMALLINT;
