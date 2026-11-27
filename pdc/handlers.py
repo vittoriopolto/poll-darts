@@ -8,7 +8,7 @@ import warnings
 from datetime import datetime, timedelta, timezone
 from html import escape
 
-from telegram import (ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup, Update)
+from telegram import (ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update)
 from telegram.constants import ChatMemberStatus, ChatType, ParseMode
 from telegram.error import BadRequest, Forbidden, TelegramError
 from telegram.ext import (Application, CallbackQueryHandler, ChatMemberHandler, CommandHandler,
@@ -1037,11 +1037,11 @@ async def send_ranking(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, *, session:
     footer = f"SU = voti dati su partite concluse · aggiornata {datetime.now(c.tz):%d/%m %H:%M}"
     head = f"🏆 <b>{escape(title)}</b>\n{escape(subtitle)}\n\n"
 
-    async def send_text() -> None:
+    async def send_text(intro: str = head) -> None:
         lines = [_rank_line(*row) for row in table] or ["Nessun voto ancora."]
-        chunk = head
+        chunk = intro
         for line in lines:  # i messaggi Telegram hanno un limite di 4096 caratteri
-            if len(chunk) + len(line) > 3900:
+            if chunk and len(chunk) + len(line) > 3900:
                 await ctx.bot.send_message(chat_id, chunk, parse_mode=ParseMode.HTML)
                 chunk = ""
             chunk += line + "\n"
@@ -1050,19 +1050,24 @@ async def send_ranking(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, *, session:
     if text_only:
         await send_text()
         return
-    top = "\n".join(_rank_line(*row) for row in table[:10]) or "Nessun voto ancora."
-    caption = head + top
-    if len(caption) > 1000:
-        caption = head + "\n".join(_rank_line(*row) for row in table[:5])
+    # Le immagini vanno insieme (album) con didascalia solo l'intro; poi un messaggio con la classifica intera.
+    intro = head.rstrip()
     try:
         pages = images.chunks(table, 30)
-        for i, page in enumerate(pages):
-            t = title if len(pages) == 1 else f"{title} ({i + 1}/{len(pages)})"
-            png = images.ranking_image(t, subtitle, page, footer)
-            await ctx.bot.send_photo(chat_id, png, caption=caption if i == 0 else None, parse_mode=ParseMode.HTML)
+        pngs = [images.ranking_image(title if len(pages) == 1 else f"{title} ({i + 1}/{len(pages)})",
+                                     subtitle, page, footer) for i, page in enumerate(pages)]
+        if len(pngs) == 1:
+            await ctx.bot.send_photo(chat_id, pngs[0], caption=intro, parse_mode=ParseMode.HTML)
+        else:
+            for start in range(0, len(pngs), 10):  # un album Telegram contiene al massimo 10 foto
+                await ctx.bot.send_media_group(chat_id, [
+                    InputMediaPhoto(png, caption=intro if start + j == 0 else None, parse_mode=ParseMode.HTML)
+                    for j, png in enumerate(pngs[start:start + 10])])
     except TelegramError:
         log.exception("invio immagine classifica fallito, ripiego sul testo")
         await send_text()
+        return
+    await send_text("")
 
 
 def _is_txt_command(update: Update) -> bool:

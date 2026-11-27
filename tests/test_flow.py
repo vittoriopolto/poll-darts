@@ -45,6 +45,10 @@ class FakeBot:
         assert photo[:8] == b"\x89PNG\r\n\x1a\n"
         self._log("photo", chat_id, **kw)
 
+    async def send_media_group(self, chat_id, media, **kw):
+        assert 2 <= len(media) <= 10 and all(m.media.input_file_content[:8] == b"\x89PNG\r\n\x1a\n" for m in media)
+        self._log("album", chat_id, [m.caption for m in media])
+
     async def send_poll(self, chat_id, question, options, **kw):
         n = next(self.ids)
         self._log("poll", chat_id, question, options, **kw)
@@ -339,9 +343,24 @@ async def scenario():
     upd, rep = make_update(user_id=PLAYER, chat_id=GROUP, chat_type="supergroup")
     await h.cmd_ranking_session(upd, make_ctx(bot, cfg, database, []))
     await h.cmd_ranking(upd, make_ctx(bot, cfg, database, []))
-    photos = [c for c in bot.calls if c[0] == "photo"]
-    assert len(photos) == 2 and "1. @player1 – <b>2</b> (2/3, 67%)" in photos[0][2]["caption"]
-    assert "3. @player3 – <b>1</b> (1/3, 33%)" in photos[0][2]["caption"]
+    # immagine con didascalia solo l'intro, poi la classifica intera in un messaggio
+    assert [c[0] for c in bot.calls] == ["photo", "msg", "photo", "msg"]
+    cap = bot.calls[0][2]["caption"]
+    assert cap.startswith("🏆 <b>Classifica sessione</b>") and "player" not in cap
+    assert "1. @player1 – <b>2</b> (2/3, 67%)" in bot.calls[1][1][1]
+    assert "3. @player3 – <b>1</b> (1/3, 33%)" in bot.calls[1][1][1] and "🏆" not in bot.calls[1][1][1]
+    # più immagini: un unico album, didascalia (intro) solo sulla prima, poi il testo completo
+    bot.calls.clear()
+    orig_chunks = h.images.chunks
+    h.images.chunks = lambda rows, size=30: [[r] for r in rows]
+    try:
+        await h.cmd_ranking_session(upd, make_ctx(bot, cfg, database, []))
+    finally:
+        h.images.chunks = orig_chunks
+    assert [c[0] for c in bot.calls] == ["album", "msg"]
+    caps = bot.calls[0][1][1]
+    assert len(caps) == 3 and caps[0].startswith("🏆") and caps[1:] == [None, None]
+    assert all(f"@player{i}" in bot.calls[1][1][1] for i in (1, 2, 3))
     # versione solo testo
     bot.calls.clear()
     await h.cmd_ranking_session(upd, make_ctx(bot, cfg, database, ["1", "txt"]))
@@ -378,13 +397,14 @@ async def scenario():
     upd, edits = make_cb("rk:s:1:1:0")
     await h.cb_ranking(upd, ctx)
     assert "Anteprima" in edits[0]
-    assert [(c[0], c[1][0]) for c in bot.calls] == [("photo", ADMIN), ("msg", ADMIN)]
-    assert "1. player1 – <b>2</b>" in bot.calls[0][2]["caption"] and "@" not in bot.calls[0][2]["caption"]
-    assert kb_data(bot.calls[1]) == ["rk:s:1:1:0:go", "rk:x"]
+    assert [(c[0], c[1][0]) for c in bot.calls] == [("photo", ADMIN), ("msg", ADMIN), ("msg", ADMIN)]
+    assert "1. player1 – <b>2</b>" in bot.calls[1][1][1] and "@" not in bot.calls[1][1][1]
+    assert kb_data(bot.calls[2]) == ["rk:s:1:1:0:go", "rk:x"]
     bot.calls.clear()
     upd, edits = make_cb("rk:s:1:1:0:go")
     await h.cb_ranking(upd, ctx)
-    assert [(c[0], c[1][0]) for c in bot.calls] == [("photo", GROUP)] and "mandata nel gruppo" in edits[0]
+    assert [(c[0], c[1][0]) for c in bot.calls] == [("photo", GROUP), ("msg", GROUP)]
+    assert "mandata nel gruppo" in edits[0]
     # privato: annulla
     bot.calls.clear()
     upd, edits = make_cb("rk:x")
