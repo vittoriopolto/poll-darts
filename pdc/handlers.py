@@ -132,7 +132,7 @@ HELP_ADMIN = (
     "/risultati_sessione <i>id</i> – inserisci i vincitori (riprende da dove eri rimasto)\n"
     "/risultati_sessione <i>id</i> tutte – rivedi/correggi tutti i risultati\n"
     "/risultato_partita <i>id_partita</i> – dai/correggi il risultato di una sola partita (o tocca ✏️ in /sessioni)\n"
-    "Quando il bot chiede chi ha vinto puoi anche scrivere il punteggio, es. <code>6-4</code>\n"
+    "Risultato: tocca il vincitore e poi i punti, oppure scrivi i punti <code>2 3</code> (giocatore 1, giocatore 2)\n"
     "/delete_event <i>id o nome</i> – elimina un evento (con o senza le sue sessioni)\n"
     "/delete_session <i>id</i> – elimina una sessione con partite e voti\n"
     "/delete_match <i>id_sessione</i> [<i>n° partita</i>] – elimina una partita e i suoi voti\n\n"
@@ -289,7 +289,7 @@ async def cmd_sessions(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_admin(update, ctx):
         return
     c = cfg(ctx)
-    sessions = await db(ctx).list_sessions(15)
+    sessions = await db(ctx).list_sessions(15, by_start=True)
     if not sessions:
         await reply(update, "Nessuna sessione. Creane una con /crea_sessione")
         return
@@ -738,7 +738,7 @@ def match_line(m: Match) -> str:
     """Riga di una partita per /partite e /sessioni (HTML).
 
     ✓ 1. <b>Menzies</b> 🏴 <b>3</b> - 2 🇦🇹 Suljovic   (giocata: vincitore e suo punteggio in grassetto)
-    ⚠️ 1. Menzies 🏴 - 🇦🇹 Suljovic                    (da giocare)
+    ○ 1. Menzies 🏴 - 🇦🇹 Suljovic                     (da giocare)
     """
     f1, n1 = _split_flag(m.player1)
     f2, n2 = _split_flag(m.player2)
@@ -758,7 +758,7 @@ def match_line(m: Match) -> str:
         mid = f" {s1} - {s2} "
     else:
         mid = " - "
-    icon = {None: "⚠️", 0: "🚫"}.get(m.winner, "✓")
+    icon = {None: "○", 0: "🚫"}.get(m.winner, "✓")
     tail = " (non disputata)" if m.winner == 0 else ""
     return f"{icon} {m.position}. {left}{mid}{right}{tail}"
 
@@ -841,8 +841,61 @@ async def cmd_match_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
     _await_score(ctx, m.id, "s", msg)
 
 
-SCORE_HINT = "\n\nTocca il vincitore, oppure scrivi il punteggio (es. <code>6-4</code>)."
-SCORE_RE = re.compile(r"^\s*(\d{1,2})\s*[-–:]\s*(\d{1,2})\s*$")
+SCORE_HINT = ("\n\nTocca il vincitore (poi ti chiedo i punti), oppure scrivi i punti: "
+              "<code>2 3</code> = giocatore 1, spazio, giocatore 2.")
+SCORE_RE = re.compile(r"^\s*(\d{1,2})(?:\s*[-–:]\s*|\s+)(\d{1,2})\s*$")
+KEYCAPS = ["0️⃣", "1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣"]
+
+
+def _points_kb(prefix: str, values: list[int], skip: str | None) -> InlineKeyboardMarkup:
+    btns = [InlineKeyboardButton(KEYCAPS[v], callback_data=f"{prefix}:{v}") for v in values]
+    rows = [btns[i:i + 5] for i in range(0, len(btns), 5)]
+    if skip:
+        rows.append([InlineKeyboardButton("⏭ Senza punteggio", callback_data=skip)])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _result_saved(ctx: ContextTypes.DEFAULT_TYPE, q, m: Match, mode: str) -> None:
+    """Risultato completo: aggiorna il messaggio e, se serve, passa alla partita successiva."""
+    if (ctx.user_data.get("score_for") or {}).get("match_id") == m.id:
+        ctx.user_data.pop("score_for", None)
+    await q.edit_message_text(f"✅ {m.position}. {escape(m.label())} → <b>{escape(_winner_text(m))}</b>",
+                              parse_mode=ParseMode.HTML)
+    if mode != "s":
+        await _ask_next(ctx, q.message.chat.id, m.session_id, mode, m.position)
+
+
+async def cb_points(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Tasti dei punti: pw:mode:match:winner:N (punti vincitore), pl:mode:match:winner:wp:N (punti perdente)."""
+    q = update.callback_query
+    if not is_admin(update, ctx):
+        await q.answer("Solo admin", show_alert=True)
+        return
+    parts = q.data.split(":")
+    kind, mode, mid, w = parts[0], parts[1], int(parts[2]), int(parts[3])
+    d = db(ctx)
+    m = await d.get_match(mid)
+    if m is None or w not in (1, 2):
+        await q.answer("Partita non trovata")
+        return
+    await q.answer()
+    winner_name, loser_name = (m.player1, m.player2) if w == 1 else (m.player2, m.player1)
+    if kind == "pw" and parts[4] == "skip":
+        m.winner, m.score1, m.score2 = w, None, None
+        await _result_saved(ctx, q, m, mode)
+        return
+    if kind == "pw":
+        wp = int(parts[4])
+        await q.edit_message_text(
+            f"{m.position}. {escape(m.label())}\n🏆 <b>{escape(winner_name)}</b> {wp}\n\n"
+            f"Punti di <b>{escape(loser_name)}</b>?", parse_mode=ParseMode.HTML,
+            reply_markup=_points_kb(f"pl:{mode}:{mid}:{w}:{wp}", list(range(wp)), None))
+        return
+    wp, lp = int(parts[4]), int(parts[5])
+    s1, s2 = (wp, lp) if w == 1 else (lp, wp)
+    await d.set_winner(m.id, w, s1, s2)
+    m.winner, m.score1, m.score2 = w, s1, s2
+    await _result_saved(ctx, q, m, mode)
 
 
 def _await_score(ctx: ContextTypes.DEFAULT_TYPE, match_id: int, mode: str, msg) -> None:
@@ -862,7 +915,7 @@ async def on_score_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     s1, s2 = int(mt.group(1)), int(mt.group(2))
     if s1 == s2:
-        await reply(update, "Pareggio non valido: scrivi il punteggio con un vincitore, es. <code>6-4</code>.")
+        await reply(update, "Pareggio non valido: scrivi i punti con un vincitore, es. <code>2 3</code>.")
         return
     d = db(ctx)
     m = await d.get_match(pending["match_id"])
@@ -893,7 +946,7 @@ async def cb_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await q.answer("Solo admin", show_alert=True)
         return
     _, mode, match_id, value = q.data.split(":")
-    if (ctx.user_data.get("score_for") or {}).get("match_id") == int(match_id):
+    if value in ("0", "stop") and (ctx.user_data.get("score_for") or {}).get("match_id") == int(match_id):
         ctx.user_data.pop("score_for", None)
     d = db(ctx)
     m = await d.get_match(int(match_id))
@@ -910,13 +963,17 @@ async def cb_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             f"⏸ Sessione non conclusa: riprendi quando vuoi con /risultati_sessione {m.session_id}")
         return
     await q.answer()
-    await d.set_winner(m.id, int(value))
-    m.winner = int(value)
-    await q.edit_message_text(f"✅ {m.position}. {escape(m.label())} → <b>{escape(_winner_text(m))}</b>",
-                              parse_mode=ParseMode.HTML)
-    if mode == "s":
+    w = int(value)
+    await d.set_winner(m.id, w)  # il vincitore vale subito; i punti si aggiungono con i tasti
+    m.winner, m.score1, m.score2 = w, None, None
+    if w == 0:
+        await _result_saved(ctx, q, m, mode)
         return
-    await _ask_next(ctx, q.message.chat.id, m.session_id, mode, m.position)
+    winner_name = m.player1 if w == 1 else m.player2
+    await q.edit_message_text(
+        f"{m.position}. {escape(m.label())}\n🏆 <b>{escape(winner_name)}</b>\n\n"
+        f"Punti di <b>{escape(winner_name)}</b>?", parse_mode=ParseMode.HTML,
+        reply_markup=_points_kb(f"pw:{mode}:{m.id}:{w}", list(range(1, 10)), f"pw:{mode}:{m.id}:{w}:skip"))
 
 
 async def cb_publish(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1524,6 +1581,7 @@ def setup(app: Application) -> None:
     app.add_handler(CommandHandler("eventi", cmd_events))
     app.add_handler(CommandHandler("sessione_evento", cmd_session_event))
     app.add_handler(CallbackQueryHandler(cb_result, pattern=r"^r:"))
+    app.add_handler(CallbackQueryHandler(cb_points, pattern=r"^p[wl]:"))
     app.add_handler(CallbackQueryHandler(cb_publish, pattern=r"^pub:"))
     app.add_handler(CallbackQueryHandler(cb_matches_to_group, pattern=r"^ptg:"))
     app.add_handler(CallbackQueryHandler(cb_delete, pattern=r"^del[xsem]"))

@@ -143,7 +143,7 @@ async def scenario():
     upd, rep = make_update()
     await h.cmd_matches(upd, make_ctx(bot, cfg, database, ["1"]))
     assert rep[0].startswith("🏆 Open di Natale\n📁 Mercoledì pomeriggio\n⏰ ")
-    assert rep[0].endswith("\n\n⚠️ 1. Rossi - Bianchi\n⚠️ 2. Verdi - Neri\n⚠️ 3. Gialli - Blu"), rep[0]
+    assert rep[0].endswith("\n\n○ 1. Rossi - Bianchi\n○ 2. Verdi - Neri\n○ 3. Gialli - Blu"), rep[0]
     assert "Nessun gruppo conosciuto" in rep[1]            # sessione mai lanciata, nessun gruppo noto
     # nessuna sessione lanciata, ma il bot ha visto qualcuno scrivere nel gruppo: usa quel gruppo
     await database.upsert_user(777, "u777", "Nome", None, GROUP, "left")  # "left": non conta tra i membri
@@ -221,7 +221,15 @@ async def scenario():
     await h.cmd_results(upd, make_ctx(bot, cfg, database, ["1"]))
     assert "0/3" in rep[0]
     m1, m2, m3 = await database.get_matches(1)
-    await h.cb_result(make_cb(f"r:m:{m1.id}:1")[0], ctx)        # vince Rossi
+    upd, edits = make_cb(f"r:m:{m1.id}:1")                      # vince Rossi...
+    await h.cb_result(upd, ctx)
+    assert "Punti di <b>Rossi</b>?" in edits[0]
+    upd, edits = make_cb(f"pw:m:{m1.id}:1:3")                   # ...con 3 punti...
+    await h.cb_points(upd, ctx)
+    assert "Punti di <b>Bianchi</b>?" in edits[0]
+    upd, edits = make_cb(f"pl:m:{m1.id}:1:3:1")                 # ...contro 1
+    await h.cb_points(upd, ctx)
+    assert "Rossi (3-1)" in edits[0] and "Verdi - Neri" in bot.calls[-1][1][1]   # e passa alla 2
     upd, edits = make_cb(f"r:m:{m2.id}:stop")
     await h.cb_result(upd, ctx)
     assert "non conclusa" in edits[0]
@@ -237,16 +245,24 @@ async def scenario():
     assert "1/3" in rep[0]
     assert "Verdi - Neri" in bot.calls[-1][1][1]
     await h.cb_result(make_cb(f"r:m:{m2.id}:1")[0], ctx)        # vince Verdi
+    await h.cb_points(make_cb(f"pw:m:{m2.id}:1:skip")[0], ctx)  # senza punteggio
     bot.calls.clear()
-    await h.cb_result(make_cb(f"r:m:{m3.id}:2")[0], ctx)        # vince Blu
+    await h.cb_result(make_cb(f"r:m:{m3.id}:2")[0], ctx)        # vince Blu: perdente = giocatore 1
+    assert bot.calls == []
+    await h.cb_points(make_cb(f"pw:m:{m3.id}:2:3")[0], ctx)
+    await h.cb_points(make_cb(f"pl:m:{m3.id}:2:3:2")[0], ctx)   # Gialli 2 - 3 Blu
     assert "Tutte le 3 partite" in bot.calls[-1][1][1]
+    m3 = await database.get_match(m3.id)
+    assert (m3.winner, m3.score1, m3.score2) == (2, 2, 3)
+    assert h._points_kb("pl:m:1:1:3", list(range(3)), None).inline_keyboard[0][0].text == "0️⃣"
 
     # /sessioni: riga di stato + partite con ID e vincitore
     upd, rep = make_update()
     await h.cmd_sessions(upd, make_ctx(bot, cfg, database))
     assert "risultati 3/3" in rep[0]
-    assert f'start=rp_{m1.id}">✏️{m1.id}</a> ✓ 1. <b>Rossi</b> - Bianchi' in rep[0]
-    assert f'✏️{m3.id}</a> ✓ 3. Gialli - <b>Blu</b>' in rep[0]
+    assert f'start=rp_{m1.id}">✏️{m1.id}</a> ✓ 1. <b>Rossi</b> <b>3</b> - 1 Bianchi' in rep[0]
+    assert f'✏️{m2.id}</a> ✓ 2. <b>Verdi</b> - Neri' in rep[0]
+    assert f'✏️{m3.id}</a> ✓ 3. Gialli 2 - <b>3</b> <b>Blu</b>' in rep[0]
     # un click su ✏️ = /start rp_ID: apre il risultato di quella partita
     upd, rep = make_update()
     await h.cmd_start(upd, make_ctx(bot, cfg, database, [f"rp_{m2.id}"]))
@@ -257,7 +273,7 @@ async def scenario():
     markups = []
     upd, rep = make_update(markups=markups)
     await h.cmd_match_result(upd, make_ctx(bot, cfg, database, [str(m3.id)]))
-    assert "Gialli - Blu" in rep[0] and "(attuale: Blu)" in rep[0]
+    assert "Gialli - Blu" in rep[0] and "(attuale: Blu (2-3))" in rep[0]
     assert markups[0].inline_keyboard[2][1].text == "❌ Annulla"
     upd, edits = make_cb(f"r:s:{m3.id}:stop")
     await h.cb_result(upd, ctx)
@@ -265,22 +281,24 @@ async def scenario():
     bot.calls.clear()
     upd, edits = make_cb(f"r:s:{m3.id}:1")
     await h.cb_result(upd, ctx)
+    assert "Punti di <b>Gialli</b>" in edits[0] and (await database.get_match(m3.id)).winner == 1
+    upd, edits = make_cb(f"pw:s:{m3.id}:1:skip")
+    await h.cb_points(upd, ctx)
     assert "→ <b>Gialli</b>" in edits[0] and bot.calls == []    # nessuna domanda successiva
-    assert (await database.get_match(m3.id)).winner == 1
     await h.cb_result(make_cb(f"r:s:{m3.id}:2")[0], ctx)        # rimetto Blu
 
     # punteggio scritto a mano: "2-6" -> vince Blu 6-2
     sctx = make_ctx(bot, cfg, database, [str(m3.id)])
     upd, rep = make_update()
     await h.cmd_match_result(upd, sctx)
-    assert "scrivi il punteggio" in rep[0]
+    assert "scrivi i punti" in rep[0]
     upd, rep = make_update(text="3-3")
     await h.on_score_text(upd, sctx)
     assert "Pareggio" in rep[0]
     upd, rep = make_update(text="ciao")
     await h.on_score_text(upd, sctx)
     assert rep == []                                            # testo qualsiasi: ignorato
-    upd, rep = make_update(text="2 - 6")
+    upd, rep = make_update(text="2 6")                          # giocatore 1, spazio, giocatore 2
     await h.on_score_text(upd, sctx)
     assert "Blu (2-6)" in rep[0]
     m3 = await database.get_match(m3.id)
@@ -296,7 +314,7 @@ async def scenario():
     mm = Match(1, 1, 15, "🏴 Cameron Menzies", "🇦🇹 Mensur Suljovic", None, None, 1, 3, 2)
     assert h.match_line(mm) == "✓ 15. <b>Cameron Menzies</b> 🏴 <b>3</b> - 2 🇦🇹 Mensur Suljovic"
     mm.winner, mm.score1, mm.score2 = None, None, None
-    assert h.match_line(mm) == "⚠️ 15. Cameron Menzies 🏴 - 🇦🇹 Mensur Suljovic"
+    assert h.match_line(mm) == "○ 15. Cameron Menzies 🏴 - 🇦🇹 Mensur Suljovic"
     mm.winner = 0
     assert h.match_line(mm).startswith("🚫 15.")
     # il bottone cancella il punteggio vecchio
@@ -384,6 +402,10 @@ async def scenario():
     upd, rep = make_update()
     await h.cmd_events(upd, make_ctx(bot, cfg, database, []))
     assert "2 sessioni" in rep[0]
+
+    # /sessioni: dalla più recente alla più vecchia per orario di inizio
+    ss = await database.list_sessions(15, by_start=True)
+    assert len(ss) > 1 and [x.starts_at for x in ss] == sorted((x.starts_at for x in ss), reverse=True)
 
     # --- eliminazioni
     sid3 = await database.create_session("Da tagliare", start, ADMIN, [("A", "B"), ("C", "D"), ("E", "F")], 1)

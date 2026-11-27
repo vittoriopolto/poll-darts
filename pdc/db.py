@@ -203,10 +203,12 @@ class DB:
             session_id)
         return Session(**dict(row)) if row else None
 
-    async def list_sessions(self, limit: int = 10) -> list[Session]:
+    async def list_sessions(self, limit: int = 10, by_start: bool = False) -> list[Session]:
+        """Ultime sessioni: per ID (creazione) o, con by_start, per orario di inizio (più recente prima)."""
+        order = "starts_at DESC, id DESC" if by_start else "id DESC"
         rows = await self.pool.fetch(
             "SELECT id, name, starts_at, created_by, chat_id, launched_at, closed_at, event_id "
-            "FROM sessions ORDER BY id DESC LIMIT $1", limit)
+            f"FROM sessions ORDER BY {order} LIMIT $1", limit)
         return [Session(**dict(r)) for r in rows]
 
     async def latest_session_for_chat(self, chat_id: int) -> Session | None:
