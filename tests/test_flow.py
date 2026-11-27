@@ -661,7 +661,7 @@ async def scenario_lookup(monkeypatch):
         return ["Rob Owen 6-5 Tom Bissell\nKevin Doets 6-1 Ritchie Edhouse\nRoss Smith v Michael Smith"]
     monkeypatch.setattr(livescore, "fetch_day", fake_day)
 
-    start = datetime(2026, 11, 27, 20, 0, tzinfo=TZ)
+    start = datetime.now(TZ).replace(microsecond=0) - timedelta(hours=1)
     sid = await database.create_session("PC Finals", start, ADMIN,
                                         [("Bissell T.", "Owen R."), ("Doets", "Edhouse"), ("Ross Smith", "Michael Smith")])
     m1, m2, m3 = await database.get_matches(sid)
@@ -710,6 +710,24 @@ async def scenario_lookup(monkeypatch):
     upd, rep = make_update()
     await h.cmd_search_results(upd, make_ctx(bot, cfg, database, [str(sid)]))
     assert "non risponde" in rep[0]
+    assert "incollali qui in chat" in rep[0]
+    monkeypatch.setattr(livescore, "fetch_day", fake_day)
+
+    # incolla da diretta.it: il testo in privato viene abbinato alle partite mancanti
+    upd, rep = make_update(text="Finale\nSmith R.\nSmith M.\n3\n6\n11 L\n\nFinale\nRossi A.\nBianchi B.\n6\n0\n11 L")
+    await h.on_score_text(upd, ctx_p := make_ctx(bot, cfg, database))
+    assert "Trovati 1 risultati" in rep[0] and "PC Finals" in rep[0] and "1 righe senza partita" in rep[0]
+    bot.calls.clear()
+    upd, _ = make_cb("lpok")
+    await h.cb_paste_answer(upd, ctx_p)
+    m = await database.get_match(m3.id)
+    assert (m.winner, m.score1, m.score2) == (2, 3, 6)
+    texts = [c[1][1] for c in bot.calls if c[0] == "msg"]
+    assert "Salvati 1" in texts[0] and "Fatto!" in texts[-1]
+    upd, rep = make_update(text="ciao\ncome\nva\noggi?")
+    await h.on_score_text(upd, make_ctx(bot, cfg, database))
+    assert rep == []
+
     await database.close()
 
 
