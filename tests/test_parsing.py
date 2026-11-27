@@ -48,3 +48,12 @@ def test_parse_start():
 def test_positions():
     assert competition_positions([5, 5, 3, 2, 2, 0]) == [1, 1, 3, 4, 4, 6]
     assert competition_positions([]) == []
+
+
+def test_image_chunks_even():
+    from pdc.images import chunks
+    sizes = lambda n: [len(c) for c in chunks(list(range(n)), 30)]
+    assert sizes(0) == [0] and sizes(1) == [1] and sizes(30) == [30]
+    assert sizes(31) == [16, 15] and sizes(50) == [25, 25] and sizes(60) == [30, 30]
+    assert sizes(80) == [27, 27, 26] and sizes(91) == [23, 23, 23, 22]
+    assert sum(chunks(list(range(80)), 30), []) == list(range(80))
