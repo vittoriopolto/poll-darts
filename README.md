@@ -47,6 +47,12 @@ Il riepilogo di `/crea_sessione` mostra a quale evento verrà assegnata la sessi
 
 A fine inserimento risultati il bot offre il bottone **📣 Pubblica classifica nel gruppo**.
 
+**Classifiche lanciate da admin** (qualsiasi `/ranking…`, anche le `_txt` e il bottone qui sopra):
+il bot prepara la classifica e chiede con i bottoni 1) *Metto l'immagine?* sì/no, 2) *Taggo le persone?*
+sì/no. In privato poi manda l'anteprima di cosa pubblicherebbe e chiede **📣 Manda sul gruppo / Annulla**
+(gruppo = quello della sessione, altrimenti l'ultimo usato). Nel gruppo la terza domanda non c'è: pubblica subito.
+Chi ha scelto 🛑 Stop Tag resta comunque senza @. Per chi non è admin i comandi funzionano come prima.
+
 ## Come funziona Telegram (cose importanti)
 
 - **I voti arrivano a ogni click**, non a fine sondaggio: il bot riceve un update `poll_answer` ogni
