@@ -642,3 +642,76 @@ async def feedback_scenario(bot, cfg, database):
 
 def test_full_flow():
     asyncio.run(scenario())
+
+
+async def scenario_lookup(monkeypatch):
+    import asyncpg
+    from pdc import livescore
+    con = await asyncpg.connect(DSN)
+    await con.execute("DROP TABLE IF EXISTS feedback_answers, feedback_options, feedback_questions, feedback_pools, votes, matches, sessions, events, group_members, users CASCADE")
+    await con.close()
+    cfg = Config(bot_token="1:x", database_url=DSN, admin_ids=frozenset({ADMIN}), tz=TZ, public_url=None,
+                 port=0, webhook_secret="s", close_minutes_before=5, cover_title="PDC180 POLL", mute_mode="invio")
+    database = await DB.connect(DSN, 5)
+    bot = FakeBot()
+    days = []
+
+    async def fake_day(day):
+        days.append(day)
+        return ["Rob Owen 6-5 Tom Bissell\nKevin Doets 6-1 Ritchie Edhouse\nRoss Smith v Michael Smith"]
+    monkeypatch.setattr(livescore, "fetch_day", fake_day)
+
+    start = datetime(2026, 11, 27, 20, 0, tzinfo=TZ)
+    sid = await database.create_session("PC Finals", start, ADMIN,
+                                        [("Bissell T.", "Owen R."), ("Doets", "Edhouse"), ("Ross Smith", "Michael Smith")])
+    m1, m2, m3 = await database.get_matches(sid)
+
+    # /sessioni: link 🔎 per la sessione con risultati mancanti
+    upd, rep = make_update()
+    await h.cmd_sessions(upd, make_ctx(bot, cfg, database))
+    assert f'start=cr_{sid}">🔎 Cerca risultati</a>' in rep[0]
+
+    # singola partita: tasto 🔎 sotto Chi ha vinto?
+    mk = []
+    upd, rep = make_update(markups=mk)
+    await h.cmd_match_result(upd, make_ctx(bot, cfg, database, [str(m1.id)]))
+    assert mk[0].inline_keyboard[-1][0].callback_data == f"lr:s:{m1.id}"
+    ctx = make_ctx(bot, cfg, database)
+    upd, edits = make_cb(f"lr:s:{m1.id}")
+    await h.cb_lookup_match(upd, ctx)
+    assert "Rob Owen 6-5 Tom Bissell" in edits[0] and "<b>6</b>" in edits[0]
+    assert days == [start.astimezone(timezone.utc).date()]
+    upd, edits = make_cb(f"lok:s:{m1.id}:2:5:6")
+    await h.cb_lookup_match_answer(upd, ctx)
+    m = await database.get_match(m1.id)
+    assert (m.winner, m.score1, m.score2) == (2, 5, 6)
+
+    # partita non ancora giocata: nessuna modifica
+    upd, edits = make_cb(f"lr:s:{m3.id}")
+    await h.cb_lookup_match(upd, ctx)
+    assert edits == [] and (await database.get_match(m3.id)).winner is None
+
+    # sessione: /start cr_ID → riepilogo, poi Salva
+    upd, rep = make_update()
+    await h.cmd_start(upd, ctx_s := make_ctx(bot, cfg, database, [f"cr_{sid}"]))
+    assert "trovati 1/2" in rep[0] and "(non trovata)" in rep[0]
+    bot.calls.clear()
+    upd, _ = make_cb(f"lsok:{sid}")
+    await h.cb_lookup_session_answer(upd, ctx_s)
+    m = await database.get_match(m2.id)
+    assert (m.winner, m.score1, m.score2) == (1, 6, 1)
+    texts = [c[1][1] for c in bot.calls if c[0] == "msg"]
+    assert "Salvati 1" in texts[0] and "Chi ha vinto?" in texts[-1] and "Ross Smith" in texts[-1]
+
+    # TheSportsDB giù
+    async def down(day):
+        raise livescore.FetchError("x")
+    monkeypatch.setattr(livescore, "fetch_day", down)
+    upd, rep = make_update()
+    await h.cmd_search_results(upd, make_ctx(bot, cfg, database, [str(sid)]))
+    assert "non risponde" in rep[0]
+    await database.close()
+
+
+def test_lookup_flow(monkeypatch):
+    asyncio.run(scenario_lookup(monkeypatch))

@@ -1,6 +1,7 @@
 """Comandi e gestori del bot."""
 from __future__ import annotations
 
+import dataclasses
 import json
 import re
 import logging
@@ -16,7 +17,7 @@ from telegram.ext import (Application, CallbackQueryHandler, ChatMemberHandler, 
 
 from telegram.warnings import PTBUserWarning
 
-from . import images
+from . import images, livescore
 from .config import Config
 from .db import DB, Event, Match, Session
 from .parsing import ParseError, competition_positions, fmt_dt, parse_matches, parse_start
@@ -132,6 +133,7 @@ HELP_ADMIN = (
     "/risultati_sessione <i>id</i> – inserisci i vincitori (riprende da dove eri rimasto)\n"
     "/risultati_sessione <i>id</i> tutte – rivedi/correggi tutti i risultati\n"
     "/risultato_partita <i>id_partita</i> – dai/correggi il risultato di una sola partita (o tocca ✏️ in /sessioni)\n"
+    "/cerca_risultati <i>id</i> – cerca su TheSportsDB i risultati mancanti della sessione (o tocca 🔎 in /sessioni)\n"
     "Risultato: tocca il vincitore e poi i punti, oppure scrivi i punti <code>2 3</code> (giocatore 1, giocatore 2)\n"
     "/delete_event <i>id o nome</i> – elimina un evento (con o senza le sue sessioni)\n"
     "/delete_session <i>id</i> – elimina una sessione con partite e voti\n"
@@ -170,6 +172,11 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             and is_admin(update, ctx)):
         ctx.args = [arg[3:]]
         await cmd_match_result(update, ctx)
+        return
+    if (update.effective_chat.type == ChatType.PRIVATE and arg.startswith("cr_") and arg[3:].isdigit()
+            and is_admin(update, ctx)):
+        ctx.args = [arg[3:]]
+        await cmd_search_results(update, ctx)
         return
     if update.effective_chat.type == ChatType.PRIVATE and arg.startswith("fb"):
         kind, _, rest = arg.partition("_")
@@ -302,13 +309,16 @@ async def cmd_sessions(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         done = sum(m.winner is not None for m in matches)
         state = ("🔒 chiusa" if s.closed_at else "🟢 sondaggi aperti") if s.launched_at else "📝 da lanciare"
         ev = f" · evento #{s.event_id}" if s.event_id else ""
+        search = (f' · <a href="{_deep_link(ctx, f"cr_{s.id}")}">🔎 Cerca risultati</a>'
+                  if matches and done < len(matches) else "")
         lines = [f"<b>#{s.id}</b> {escape(s.name)} – {fmt_dt(s.starts_at, c.tz)}",
-                 f"    {state} · risultati {done}/{len(matches)}{ev}"]
+                 f"    {state} · risultati {done}/{len(matches)}{ev}{search}"]
         for m in matches:
             lines.append(f'    <a href="{_deep_link(ctx, f"rp_{m.id}")}">✏️{m.id}</a> {match_line(m)}')
         blocks.append("\n".join(lines))
     blocks.append("Tocca ✏️ accanto a una partita per dare o correggere il risultato "
-                  "(oppure <code>/risultato_partita ID</code>).")
+                  "(oppure <code>/risultato_partita ID</code>). "
+                  "Tocca 🔎 per cercare i risultati mancanti della sessione.")
     for text in _chunks(blocks):
         await reply(update, text)
 
@@ -726,6 +736,7 @@ def _result_keyboard(m: Match, mode: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🚫 Non disputata", callback_data=f"r:{mode}:{m.id}:0"),
          InlineKeyboardButton("❌ Annulla" if mode == "s" else "⏸ Sessione non conclusa",
                               callback_data=f"r:{mode}:{m.id}:stop")],
+        [InlineKeyboardButton("🔎 Cerca risultato", callback_data=f"lr:{mode}:{m.id}")],
     ])
 
 
@@ -992,6 +1003,139 @@ async def cb_publish(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await q.answer()
     await q.edit_message_reply_markup(None)
     await ask_ranking_options(ctx, q.message.chat.id, "s", s.id)
+
+
+# ---------------------------------------------------------------- cerca risultati (TheSportsDB)
+
+LOOKUP_FAIL = "TheSportsDB non risponde, riprova tra poco o inserisci il risultato a mano."
+
+
+def _lookup_days(s: Session, c: Config) -> list:
+    """Giorni in cui cercare: quello della sessione (UTC e ora locale, se diversi)."""
+    return list(dict.fromkeys([s.starts_at.astimezone(timezone.utc).date(), s.starts_at.astimezone(c.tz).date()]))
+
+
+def _found_text(m: Match, f: livescore.Found) -> str:
+    return match_line(dataclasses.replace(m, winner=f.winner, score1=f.score1, score2=f.score2))
+
+
+async def cb_lookup_match(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Tasto 🔎 Cerca risultato sotto 'Chi ha vinto?': lr:mode:match."""
+    q = update.callback_query
+    if not is_admin(update, ctx):
+        await q.answer("Solo admin", show_alert=True)
+        return
+    _, mode, mid = q.data.split(":")
+    d = db(ctx)
+    m = await d.get_match(int(mid))
+    s = await d.get_session(m.session_id) if m else None
+    if not m or not s:
+        await q.answer("Partita non trovata")
+        return
+    try:
+        found = (await livescore.find_results([m], _lookup_days(s, cfg(ctx)))).get(m.id)
+    except livescore.FetchError:
+        await q.answer(LOOKUP_FAIL, show_alert=True)
+        return
+    if not found:
+        await q.answer("Risultato non trovato su TheSportsDB (forse non è ancora finita): "
+                       "mettilo a mano.", show_alert=True)
+        return
+    await q.answer()
+    await q.edit_message_text(
+        f"🔎 Trovato su TheSportsDB:\n<i>{escape(found.source)}</i>\n\n{_found_text(m, found)}\n\nLo salvo?",
+        parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Salva", callback_data=f"lok:{mode}:{m.id}:{found.winner}:{found.score1}:{found.score2}"),
+            InlineKeyboardButton("✏️ A mano", callback_data=f"lno:{mode}:{m.id}"),
+        ]]))
+
+
+async def cb_lookup_match_answer(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """lok:mode:match:w:s1:s2 salva il risultato trovato; lno:mode:match torna ai tasti manuali."""
+    q = update.callback_query
+    if not is_admin(update, ctx):
+        await q.answer("Solo admin", show_alert=True)
+        return
+    parts = q.data.split(":")
+    kind, mode, mid = parts[0], parts[1], int(parts[2])
+    d = db(ctx)
+    m = await d.get_match(mid)
+    if m is None:
+        await q.answer("Partita non trovata")
+        return
+    await q.answer()
+    if kind == "lno":
+        msg = await q.edit_message_text(
+            f"{m.position}. <b>{escape(m.label())}</b>\n\nChi ha vinto?{SCORE_HINT}",
+            parse_mode=ParseMode.HTML, reply_markup=_result_keyboard(m, mode))
+        _await_score(ctx, m.id, mode, msg)
+        return
+    w, s1, s2 = int(parts[3]), int(parts[4]), int(parts[5])
+    await d.set_winner(m.id, w, s1, s2)
+    m.winner, m.score1, m.score2 = w, s1, s2
+    await _result_saved(ctx, q, m, mode)
+
+
+async def cmd_search_results(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """/cerca_risultati <id_sessione>: cerca i risultati mancanti e li propone tutti insieme."""
+    if not is_admin(update, ctx):
+        return
+    if update.effective_chat.type != ChatType.PRIVATE:
+        await reply(update, "Cerca i risultati in privato con il bot.")
+        return
+    sid = parse_session_arg(ctx)
+    d = db(ctx)
+    s = await d.get_session(sid) if sid else None
+    if not s:
+        await reply(update, "Uso: /cerca_risultati <i>id_sessione</i>\nVedi /sessioni")
+        return
+    missing = [m for m in await d.get_matches(s.id) if m.winner is None]
+    if not missing:
+        await reply(update, f"Tutte le partite di <b>{escape(s.name)}</b> hanno già un risultato.")
+        return
+    try:
+        found = await livescore.find_results(missing, _lookup_days(s, cfg(ctx)))
+    except livescore.FetchError:
+        await reply(update, LOOKUP_FAIL)
+        return
+    lines = [_found_text(m, found[m.id]) if m.id in found else f"{match_line(m)}  <i>(non trovata)</i>"
+             for m in missing]
+    head = f"🔎 <b>{escape(s.name)}</b> – trovati {len(found)}/{len(missing)} risultati mancanti\n\n"
+    if not found:
+        await reply(update, head + "\n".join(lines) + "\n\nForse non sono ancora finite: riprova più tardi "
+                    f"o inseriscili a mano con /risultati_sessione {s.id}")
+        return
+    ctx.user_data.setdefault("lookup", {})[s.id] = {m_id: [f.winner, f.score1, f.score2] for m_id, f in found.items()}
+    await reply(update, head + "\n".join(lines) + "\n\nSalvo quelli trovati?", reply_markup=InlineKeyboardMarkup([[
+        InlineKeyboardButton(f"✅ Salva {len(found)}", callback_data=f"lsok:{s.id}"),
+        InlineKeyboardButton("❌ Annulla", callback_data=f"lsno:{s.id}"),
+    ]]))
+
+
+async def cb_lookup_session_answer(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not is_admin(update, ctx):
+        await q.answer("Solo admin", show_alert=True)
+        return
+    kind, sid = q.data.split(":")
+    sid = int(sid)
+    pending = (ctx.user_data.get("lookup") or {}).pop(sid, None)
+    await q.answer()
+    if kind == "lsno" or not pending:
+        await q.edit_message_reply_markup(None)
+        await ctx.bot.send_message(q.message.chat.id, "Nessun risultato salvato." if kind == "lsno"
+                                   else f"Ricerca scaduta: rifai /cerca_risultati {sid}")
+        return
+    d = db(ctx)
+    saved = 0
+    for m in await d.get_matches(sid):
+        r = pending.get(m.id) or pending.get(str(m.id))
+        if r and m.winner is None:  # nel frattempo non è stato messo a mano
+            await d.set_winner(m.id, *r)
+            saved += 1
+    await q.edit_message_reply_markup(None)
+    await ctx.bot.send_message(q.message.chat.id, f"✅ Salvati {saved} risultati.")
+    await _ask_next(ctx, q.message.chat.id, sid, "m", 0)
 
 
 # ---------------------------------------------------------------- step 4: classifiche
@@ -1703,6 +1847,10 @@ def setup(app: Application) -> None:
     app.add_handler(CommandHandler("sessione_evento", cmd_session_event))
     app.add_handler(CallbackQueryHandler(cb_result, pattern=r"^r:"))
     app.add_handler(CallbackQueryHandler(cb_points, pattern=r"^p[wl]:"))
+    app.add_handler(CommandHandler("cerca_risultati", cmd_search_results))
+    app.add_handler(CallbackQueryHandler(cb_lookup_match, pattern=r"^lr:"))
+    app.add_handler(CallbackQueryHandler(cb_lookup_match_answer, pattern=r"^l(ok|no):"))
+    app.add_handler(CallbackQueryHandler(cb_lookup_session_answer, pattern=r"^ls(ok|no):"))
     app.add_handler(CallbackQueryHandler(cb_publish, pattern=r"^pub:"))
     app.add_handler(CallbackQueryHandler(cb_ranking, pattern=r"^rk:"))
     app.add_handler(CallbackQueryHandler(cb_matches_to_group, pattern=r"^ptg:"))
