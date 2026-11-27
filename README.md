@@ -53,6 +53,9 @@ sì/no. In privato poi manda l'anteprima di cosa pubblicherebbe e chiede **📣 
 (gruppo = quello della sessione, altrimenti l'ultimo usato). Nel gruppo la terza domanda non c'è: pubblica subito.
 Chi ha scelto 🛑 Stop Tag resta comunque senza @. Per chi non è admin i comandi funzionano come prima.
 
+Con l'immagine: le immagini (1/2, 2/2…) arrivano insieme in un album con didascalia solo l'intro
+(titolo e sottotitolo), poi un messaggio di testo con la classifica completa.
+
 ## Come funziona Telegram (cose importanti)
 
 - **I voti arrivano a ogni click**, non a fine sondaggio: il bot riceve un update `poll_answer` ogni
