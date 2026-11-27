@@ -144,6 +144,9 @@ HELP_ADMIN = (
     "<b>Comandi admin (nel gruppo)</b>\n"
     "/lancia_sondaggi <i>id</i> – muta il gruppo, pubblica copertina e sondaggi\n"
     "/muta, /smuta – muta/smuta il gruppo a mano\n\n"
+    "<b>Classifiche (admin)</b>\n"
+    "Ogni /ranking… lanciato da admin chiede: immagine sì/no, tag sì/no. In privato mostra "
+    "l'anteprima e poi chiede se mandarla sul gruppo; nel gruppo la pubblica subito.\n\n"
 )
 HELP_ALL = (
     "<b>Comandi per tutti</b>\n"
@@ -986,10 +989,9 @@ async def cb_publish(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not s or not s.chat_id:
         await q.answer("Sessione mai lanciata in un gruppo", show_alert=True)
         return
-    await q.answer("Pubblico…")
-    await send_ranking(ctx, s.chat_id, session=s)
+    await q.answer()
     await q.edit_message_reply_markup(None)
-    await ctx.bot.send_message(q.message.chat.id, "📣 Classifica pubblicata nel gruppo.")
+    await ask_ranking_options(ctx, q.message.chat.id, "s", s.id)
 
 
 # ---------------------------------------------------------------- step 4: classifiche
@@ -1070,8 +1072,116 @@ def _is_txt_command(update: Update) -> bool:
     return cmd.endswith("_txt")
 
 
+# Flusso admin per pubblicare una classifica. Lo stato sta tutto nel callback_data, così
+# sopravvive ai riavvii del server: rk:<tipo g|s|e>:<id>[:<immagine 0|1>[:<tag 0|1>[:go]]]
+# Il tipo "g" (globale) nel gruppo è limitato al gruppo stesso, dal privato comprende tutto.
+
+def _yes_no_kb(base: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("✅ Sì", callback_data=f"{base}:1"),
+                                  InlineKeyboardButton("❌ No", callback_data=f"{base}:0")],
+                                 [InlineKeyboardButton("Annulla", callback_data="rk:x")]])
+
+
+async def ask_ranking_options(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, kind: str, ref_id: int) -> None:
+    """Domanda 1 del flusso admin: immagine sì/no."""
+    await ctx.bot.send_message(chat_id, "📊 Classifica pronta.\n\n<b>1/2</b> Metto l'immagine?",
+                               parse_mode=ParseMode.HTML, reply_markup=_yes_no_kb(f"rk:{kind}:{ref_id}"))
+
+
+async def _start_ranking_flow(update: Update, ctx: ContextTypes.DEFAULT_TYPE, kind: str, ref_id: int) -> None:
+    chat = update.effective_chat
+    if chat.type != ChatType.PRIVATE:
+        try:  # nel gruppo resta solo la domanda (e poi la classifica)
+            await update.effective_message.delete()
+        except TelegramError:
+            pass
+    await ask_ranking_options(ctx, chat.id, kind, ref_id)
+
+
+async def _ranking_target(ctx: ContextTypes.DEFAULT_TYPE, kind: str, ref_id: int) -> dict | None:
+    """Argomenti per send_ranking, None se la sessione/evento non esiste più."""
+    d = db(ctx)
+    if kind == "s":
+        s = await d.get_session(ref_id)
+        return {"session": s} if s else None
+    if kind == "e":
+        ev = await d.get_event(ref_id)
+        return {"event": ev} if ev else None
+    return {}
+
+
+async def _ranking_group(ctx: ContextTypes.DEFAULT_TYPE, target: dict) -> int | None:
+    s = target.get("session")
+    return (s.chat_id if s else None) or await db(ctx).last_group_chat()
+
+
+async def cb_ranking(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not is_admin(update, ctx):
+        await q.answer("Solo admin", show_alert=True)
+        return
+    parts = q.data.split(":")
+    if parts[1] == "x":
+        await q.answer()
+        await q.edit_message_text("Ok, classifica annullata.")
+        return
+    kind, ref_id, rest = parts[1], int(parts[2]), parts[3:]
+    base = ":".join(parts[:3])
+    if len(rest) == 1:  # risposta alla domanda 1 → domanda 2
+        await q.answer()
+        img = "🖼 con immagine" if rest[0] == "1" else "📝 solo testo"
+        await q.edit_message_text(f"📊 Classifica {img}.\n\n<b>2/2</b> Taggo le persone?",
+                                  parse_mode=ParseMode.HTML, reply_markup=_yes_no_kb(f"{base}:{rest[0]}"))
+        return
+    image, tag = rest[0] == "1", rest[1] == "1"
+    go = len(rest) > 2 and rest[2] == "go"
+    target = await _ranking_target(ctx, kind, ref_id)
+    if target is None:
+        await q.answer("Sessione o evento non trovato", show_alert=True)
+        return
+    chat_id = q.message.chat.id
+    private = getattr(q.message.chat, "type", ChatType.PRIVATE) == ChatType.PRIVATE
+    opts = dict(text_only=not image, tag=tag, **target)
+    if not private:  # già nel gruppo: niente anteprima, pubblico subito
+        await q.answer("Pubblico…")
+        try:
+            await q.message.delete()
+        except (TelegramError, AttributeError):
+            await q.edit_message_text("📣 Classifica pubblicata.")
+        await send_ranking(ctx, chat_id, scope_chat=chat_id if kind == "g" else None, **opts)
+        return
+    group = await _ranking_group(ctx, target)
+    if go:
+        if group is None:
+            await q.answer("Nessun gruppo conosciuto", show_alert=True)
+            return
+        await q.answer("Mando…")
+        try:
+            await send_ranking(ctx, group, **opts)
+        except TelegramError as e:
+            log.warning("classifica non inviata al gruppo %s: %s", group, e)
+            await q.edit_message_text("⚠️ Non sono riuscito a mandarla nel gruppo.")
+            return
+        await q.edit_message_text("📣 Classifica mandata nel gruppo.")
+        return
+    # domanda 3: anteprima qui in privato, poi Manda sul gruppo / Annulla
+    await q.answer()
+    what = ("🖼 immagine" if image else "📝 solo testo") + " · " + ("🏷 con tag" if tag else "senza tag")
+    await q.edit_message_text(f"👀 Anteprima ({what}):")
+    await send_ranking(ctx, chat_id, **opts)
+    if group is None:
+        await ctx.bot.send_message(chat_id, "Nessun gruppo conosciuto: lancia il comando direttamente nel gruppo.")
+        return
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("📣 Manda sul gruppo", callback_data=f"{q.data}:go"),
+                                InlineKeyboardButton("Annulla", callback_data="rk:x")]])
+    await ctx.bot.send_message(chat_id, "Mando questa classifica sul gruppo?", reply_markup=kb)
+
+
 async def cmd_ranking(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
+    if is_admin(update, ctx):
+        await _start_ranking_flow(update, ctx, "g", 0)
+        return
     # Nel gruppo: tutte le sessioni lanciate in quel gruppo. In privato: tutte le sessioni.
     scope = None if chat.type == ChatType.PRIVATE else chat.id
     notag = _is_txt_command(update)
@@ -1094,6 +1204,9 @@ async def cmd_ranking_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
     if not s:
         await reply(update, "Sessione non trovata. Uso: /ranking_sessione [<i>id</i>]")
         return
+    if is_admin(update, ctx):
+        await _start_ranking_flow(update, ctx, "s", s.id)
+        return
     await send_ranking(ctx, chat.id, session=s, text_only=text_only, tag=not notag)
 
 
@@ -1105,6 +1218,9 @@ async def cmd_ranking_event(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     ev = await d.find_event(ref) if ref else await d.latest_event()
     if not ev:
         await reply(update, "Evento non trovato. Uso: /ranking_evento [<i>id o nome</i>]")
+        return
+    if is_admin(update, ctx):
+        await _start_ranking_flow(update, ctx, "e", ev.id)
         return
     await send_ranking(ctx, update.effective_chat.id, event=ev, text_only=text_only, tag=not notag)
 
@@ -1583,6 +1699,7 @@ def setup(app: Application) -> None:
     app.add_handler(CallbackQueryHandler(cb_result, pattern=r"^r:"))
     app.add_handler(CallbackQueryHandler(cb_points, pattern=r"^p[wl]:"))
     app.add_handler(CallbackQueryHandler(cb_publish, pattern=r"^pub:"))
+    app.add_handler(CallbackQueryHandler(cb_ranking, pattern=r"^rk:"))
     app.add_handler(CallbackQueryHandler(cb_matches_to_group, pattern=r"^ptg:"))
     app.add_handler(CallbackQueryHandler(cb_delete, pattern=r"^del[xsem]"))
     app.add_handler(PollAnswerHandler(on_poll_answer))

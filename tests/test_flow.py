@@ -20,6 +20,7 @@ DSN = os.environ.get("TEST_DATABASE_URL")
 pytestmark = pytest.mark.skipif(not DSN, reason="TEST_DATABASE_URL non impostato")
 
 ADMIN, GROUP = 111, -1001
+PLAYER = 222  # non admin
 TZ = ZoneInfo("Europe/Rome")
 
 
@@ -81,7 +82,7 @@ def make_update(user_id=ADMIN, chat_id=ADMIN, chat_type="private", text="", mark
               message=msg, callback_query=None, poll_answer=None), replies
 
 
-def make_cb(data, chat_id=ADMIN, user_id=ADMIN):
+def make_cb(data, chat_id=ADMIN, user_id=ADMIN, chat_type="private"):
     edits = []
 
     async def answer(*a, **kw):
@@ -93,9 +94,13 @@ def make_cb(data, chat_id=ADMIN, user_id=ADMIN):
     async def edit_message_reply_markup(*a, **kw):
         pass
 
+    async def delete_msg():
+        edits.append("<deleted>")
+
     upd, _ = make_update(user_id=user_id, chat_id=chat_id)
     upd.callback_query = NS(data=data, answer=answer, edit_message_text=edit_message_text,
-                            edit_message_reply_markup=edit_message_reply_markup, message=NS(chat=NS(id=chat_id)))
+                            edit_message_reply_markup=edit_message_reply_markup,
+                            message=NS(chat=NS(id=chat_id, type=chat_type), delete=delete_msg))
     return upd, edits
 
 
@@ -331,7 +336,7 @@ async def scenario():
     assert pts == {"@player1": 2, "@player2": 2, "@player3": 1}
     assert rows[2].display == "@player3"
     bot.calls.clear()
-    upd, rep = make_update(chat_id=GROUP, chat_type="supergroup")
+    upd, rep = make_update(user_id=PLAYER, chat_id=GROUP, chat_type="supergroup")
     await h.cmd_ranking_session(upd, make_ctx(bot, cfg, database, []))
     await h.cmd_ranking(upd, make_ctx(bot, cfg, database, []))
     photos = [c for c in bot.calls if c[0] == "photo"]
@@ -348,10 +353,54 @@ async def scenario():
                           ("/ranking_txt", h.cmd_ranking, []),
                           ("/ranking_evento_txt@pdc_test_bot", h.cmd_ranking_event, [])):
         bot.calls.clear()
-        upd, _ = make_update(chat_id=GROUP, chat_type="supergroup", text=cmd)
+        upd, _ = make_update(user_id=PLAYER, chat_id=GROUP, chat_type="supergroup", text=cmd)
         await fn(upd, make_ctx(bot, cfg, database, args))
         assert [c[0] for c in bot.calls] == ["msg"], cmd
         assert "1. player1 – <b>2</b>" in bot.calls[0][1][1] and "@" not in bot.calls[0][1][1], cmd
+
+    # admin: domande immagine / tag / anteprima, per tutti i comandi ranking
+    def kb_data(call):
+        return [b.callback_data for row in call[2]["reply_markup"].inline_keyboard for b in row]
+
+    ctx = make_ctx(bot, cfg, database)
+    for fn, args, base in ((h.cmd_ranking, [], "rk:g:0"), (h.cmd_ranking_session, ["1"], "rk:s:1"),
+                           (h.cmd_ranking_event, [], "rk:e:1")):
+        bot.calls.clear()
+        upd, rep = make_update(text="/ranking_txt")  # anche le varianti _txt passano dalle domande
+        await fn(upd, make_ctx(bot, cfg, database, args))
+        assert [c[0] for c in bot.calls] == ["msg"] and "Metto l'immagine?" in bot.calls[0][1][1]
+        assert kb_data(bot.calls[0]) == [f"{base}:1", f"{base}:0", "rk:x"]
+    # privato: sì immagine, no tag → anteprima in privato, poi Manda sul gruppo
+    bot.calls.clear()
+    upd, edits = make_cb("rk:s:1:1")
+    await h.cb_ranking(upd, ctx)
+    assert "Taggo le persone?" in edits[0]
+    upd, edits = make_cb("rk:s:1:1:0")
+    await h.cb_ranking(upd, ctx)
+    assert "Anteprima" in edits[0]
+    assert [(c[0], c[1][0]) for c in bot.calls] == [("photo", ADMIN), ("msg", ADMIN)]
+    assert "1. player1 – <b>2</b>" in bot.calls[0][2]["caption"] and "@" not in bot.calls[0][2]["caption"]
+    assert kb_data(bot.calls[1]) == ["rk:s:1:1:0:go", "rk:x"]
+    bot.calls.clear()
+    upd, edits = make_cb("rk:s:1:1:0:go")
+    await h.cb_ranking(upd, ctx)
+    assert [(c[0], c[1][0]) for c in bot.calls] == [("photo", GROUP)] and "mandata nel gruppo" in edits[0]
+    # privato: annulla
+    bot.calls.clear()
+    upd, edits = make_cb("rk:x")
+    await h.cb_ranking(upd, ctx)
+    assert bot.calls == [] and "annullata" in edits[0]
+    # nel gruppo: niente anteprima, pubblica subito (testo con tag)
+    bot.calls.clear()
+    upd, edits = make_cb("rk:g:0:0:1", chat_id=GROUP, chat_type="supergroup")
+    await h.cb_ranking(upd, ctx)
+    assert edits == ["<deleted>"] and [(c[0], c[1][0]) for c in bot.calls] == [("msg", GROUP)]
+    assert "1. @player1 – <b>2</b>" in bot.calls[0][1][1]
+    # i bottoni sono solo per l'admin
+    bot.calls.clear()
+    upd, edits = make_cb("rk:g:0:0:1", chat_id=GROUP, user_id=PLAYER, chat_type="supergroup")
+    await h.cb_ranking(upd, ctx)
+    assert bot.calls == [] and edits == []
 
     # --- chiusura: voti oltre l'orario ignorati, job chiude i sondaggi
     await database.pool.execute("UPDATE sessions SET starts_at = now() + interval '4 minutes'")
@@ -372,7 +421,7 @@ async def scenario():
     names2 = [r.display for r in await database.ranking()]
     assert voter[1:] in names2 and voter not in names2
     bot.calls.clear()
-    upd, rep = make_update()
+    upd, rep = make_update(user_id=PLAYER, chat_id=PLAYER)
     await h.cmd_ranking(upd, make_ctx(bot, cfg, database, ["txt"]))
     txt = (bot.calls[0][1][1] if bot.calls else "") + "".join(rep)
     assert f" {voter[1:]}" in txt and voter not in txt
@@ -381,7 +430,7 @@ async def scenario():
     # --- eventi: classifica evento, chiusura, sessione fuori evento
     assert {r.display: r.points for r in await database.ranking(event_id=1)} == pts
     bot.calls.clear()
-    upd, rep = make_update(chat_id=GROUP, chat_type="supergroup")
+    upd, rep = make_update(user_id=PLAYER, chat_id=GROUP, chat_type="supergroup")
     await h.cmd_ranking_event(upd, make_ctx(bot, cfg, database, ["open", "di", "natale"]))
     assert "Classifica evento" in bot.calls[0][2]["caption"] and "in corso" in bot.calls[0][2]["caption"]
     bot.calls.clear()
