@@ -205,8 +205,18 @@ def feedback_image(title: str) -> bytes:
 
 
 def chunks(rows: list, size: int = 30) -> list[list]:
-    """Una classifica molto lunga viene divisa in più immagini."""
-    return [rows[i:i + size] for i in range(0, len(rows), size)] or [[]]
+    """Una classifica lunga viene divisa in più immagini: prima quante ne servono (max `size` righe
+    l'una), poi le righe distribuite in modo equo (es. 80 righe → 3 immagini da 27, 27, 26)."""
+    if not rows:
+        return [[]]
+    n = -(-len(rows) // size)  # immagini necessarie
+    base, extra = divmod(len(rows), n)
+    out, start = [], 0
+    for i in range(n):
+        end = start + base + (1 if i < extra else 0)
+        out.append(rows[start:end])
+        start = end
+    return out
 
 
 __all__ = ["cover_image", "ranking_image", "feedback_image", "chunks"]
