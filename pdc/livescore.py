@@ -45,9 +45,15 @@ class FetchError(Exception):
     """TheSportsDB non raggiungibile o risposta non valida."""
 
 
+# Lettere che NFKD non scompone (Białecki, Mølgaard, Đorđević…): le traslitteriamo a mano.
+_TRANSLIT = str.maketrans({"ł": "l", "Ł": "L", "ø": "o", "Ø": "O", "đ": "d", "Đ": "D", "ß": "ss",
+                           "æ": "ae", "Æ": "AE", "œ": "oe", "Œ": "OE", "ı": "i", "þ": "th", "ð": "d"})
+
+
 def _tokens(name: str) -> list[str]:
     """'🏴 Gary O'Connor' -> ['gary', 'oconnor'] (niente accenti, bandiere, punteggiatura)."""
-    s = unicodedata.normalize("NFKD", name)
+    s = name.translate(_TRANSLIT)
+    s = unicodedata.normalize("NFKD", s)
     s = "".join(ch for ch in s if not unicodedata.combining(ch)).lower()
     s = re.sub(r"['’`]", "", s)
     s = re.sub(r"[^a-z0-9]+", " ", s)
