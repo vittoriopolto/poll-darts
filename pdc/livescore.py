@@ -64,10 +64,10 @@ def name_score(ours: str, theirs: str) -> int:
     if not a or not b:
         return 0
 
-    def ok(t: str) -> bool:
-        return t in b or (len(t) == 1 and any(x.startswith(t) for x in b))
+    def covers(xs: list[str], ys: list[str]) -> bool:
+        return all(t in ys or (len(t) == 1 and any(y.startswith(t) for y in ys)) for t in xs)
 
-    if all(ok(t) for t in a):
+    if covers(a, b) or covers(b, a):  # 'Ross Smith' = 'Smith R.' in entrambe le direzioni
         return 2
     words = [t for t in a if len(t) >= 2]
     if words and words[-1] in b:
@@ -87,6 +87,46 @@ def parse_results(text: str) -> list[tuple[str, int, int, str, str]]:
             continue
         out.append((a, sa, sb, b, line.strip()))
     return out
+
+
+FINISHED = {"finale", "final", "finished", "ft", "terminata", "terminato", "fine", "dopo rigori"}
+
+
+def _int(line: str) -> int | None:
+    line = line.strip()
+    return int(line) if line.isdigit() and len(line) <= 2 else None
+
+
+def parse_diretta(text: str) -> tuple[list[tuple[str, int, int, str, str]], int]:
+    """Testo copiato da diretta.it/Flashscore, a blocchi:
+
+        Finale
+        Greaves B.
+        Kist C.
+        6
+        3
+        11 L
+
+    Ritorna (risultati come parse_results, numero di partite saltate perché non finite).
+    Se nel testo non c'è nessuna riga di stato si prendono tutti i blocchi nome/nome/punti/punti.
+    """
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    has_status = any(ln.lower() in FINISHED for ln in lines)
+    out, skipped = [], 0
+    i = 0
+    while i + 3 < len(lines):
+        a, b, sa, sb = lines[i], lines[i + 1], _int(lines[i + 2]), _int(lines[i + 3])
+        if _int(a) is None and _int(b) is None and sa is not None and sb is not None \
+                and any(ch.isalpha() for ch in a + b):
+            prev = lines[i - 1].lower() if i else ""
+            if sa != sb and (not has_status or prev in FINISHED):
+                out.append((a, sa, sb, b, f"{a} {sa}-{sb} {b}"))
+            else:
+                skipped += 1
+            i += 4
+            continue
+        i += 1
+    return out, skipped
 
 
 def match_results(matches, results) -> dict[int, Found]:

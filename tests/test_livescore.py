@@ -71,3 +71,60 @@ def test_find_results(monkeypatch):
     monkeypatch.setattr(ls, "fetch_day", fake)
     found = asyncio.run(ls.find_results([M(9, "Doets", "Edhouse")], [date(2026, 11, 27)]))
     assert found[9].winner == 1
+
+
+DIRETTA = """Players Championship Finals
+MONDO: 
+
+Tabellone
+
+Set
+Leg
+Punti
+
+Finale
+de Graaf J.
+van Veen G.
+6
+4
+11 L
+
+Finale
+Smith R.
+Smith M.
+3
+6
+11 L
+
+2° set
+Cross R.
+Mansell M.
+3
+2
+11 L
+
+Finale
+Greaves B.
+Kist C.
+6
+3
+11 L
+"""
+
+
+def test_parse_diretta():
+    rows, skipped = ls.parse_diretta(DIRETTA)
+    assert [(a, sa, sb, b) for a, sa, sb, b, _ in rows] == [
+        ("de Graaf J.", 6, 4, "van Veen G."), ("Smith R.", 3, 6, "Smith M."), ("Greaves B.", 6, 3, "Kist C.")]
+    assert skipped == 1                                     # Cross-Mansell ancora in corso
+    assert ls.parse_diretta("Ciao\nCome va\ntutto bene\n?")[0] == []
+
+
+def test_diretta_initials_vs_full_names():
+    rows, _ = ls.parse_diretta(DIRETTA)
+    found = ls.match_results([M(1, "Michael Smith", "🏴 Ross Smith"), M(2, "Jeffrey de Graaf", "Gian van Veen"),
+                              M(3, "Kist", "Greaves"), M(4, "Rob Cross", "Mickey Mansell")], rows)
+    assert (found[1].winner, found[1].score1, found[1].score2) == (1, 6, 3)
+    assert (found[2].winner, found[2].score1) == (1, 6)
+    assert (found[3].winner, found[3].score1, found[3].score2) == (2, 3, 6)
+    assert 4 not in found

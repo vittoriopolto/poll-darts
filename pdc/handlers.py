@@ -134,6 +134,7 @@ HELP_ADMIN = (
     "/risultati_sessione <i>id</i> tutte – rivedi/correggi tutti i risultati\n"
     "/risultato_partita <i>id_partita</i> – dai/correggi il risultato di una sola partita (o tocca ✏️ in /sessioni)\n"
     "/cerca_risultati <i>id</i> – cerca su TheSportsDB i risultati mancanti della sessione (o tocca 🔎 in /sessioni)\n"
+    "📋 <i>incolla in chat i risultati copiati da diretta.it</i> – il bot li abbina alle partite e li salva con ✅\n"
     "Risultato: tocca il vincitore e poi i punti, oppure scrivi i punti <code>2 3</code> (giocatore 1, giocatore 2)\n"
     "/delete_event <i>id o nome</i> – elimina un evento (con o senza le sue sessioni)\n"
     "/delete_session <i>id</i> – elimina una sessione con partite e voti\n"
@@ -920,8 +921,11 @@ def _await_score(ctx: ContextTypes.DEFAULT_TYPE, match_id: int, mode: str, msg) 
 
 async def on_score_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """In privato: '6-4' scritto dopo la domanda 'Chi ha vinto?' salva vincitore e punteggio."""
-    pending = ctx.user_data.get("score_for")
     msg = update.effective_message
+    if msg and msg.text and msg.text.count("\n") >= 3 and is_admin(update, ctx):
+        if await on_pasted_results(update, ctx):
+            return
+    pending = ctx.user_data.get("score_for")
     if not pending or not msg or not msg.text or not is_admin(update, ctx):
         return
     mt = SCORE_RE.match(msg.text)
@@ -1038,8 +1042,8 @@ async def cb_lookup_match(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         await q.answer(LOOKUP_FAIL, show_alert=True)
         return
     if not found:
-        await q.answer("Risultato non trovato su TheSportsDB (forse non è ancora finita): "
-                       "mettilo a mano.", show_alert=True)
+        await q.answer("Risultato non trovato su TheSportsDB (forse non è ancora finita): mettilo a mano "
+                       "oppure incolla qui in chat i risultati copiati da diretta.it.", show_alert=True)
         return
     await q.answer()
     await q.edit_message_text(
@@ -1096,14 +1100,14 @@ async def cmd_search_results(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
     try:
         found = await livescore.find_results(missing, _lookup_days(s, cfg(ctx)))
     except livescore.FetchError:
-        await reply(update, LOOKUP_FAIL)
+        await reply(update, f"{LOOKUP_FAIL}\n\n{PASTE_HINT}")
         return
     lines = [_found_text(m, found[m.id]) if m.id in found else f"{match_line(m)}  <i>(non trovata)</i>"
              for m in missing]
     head = f"🔎 <b>{escape(s.name)}</b> – trovati {len(found)}/{len(missing)} risultati mancanti\n\n"
     if not found:
         await reply(update, head + "\n".join(lines) + "\n\nForse non sono ancora finite: riprova più tardi "
-                    f"o inseriscili a mano con /risultati_sessione {s.id}")
+                    f"o inseriscili a mano con /risultati_sessione {s.id}\n\n{PASTE_HINT}")
         return
     ctx.user_data.setdefault("lookup", {})[s.id] = {m_id: [f.winner, f.score1, f.score2] for m_id, f in found.items()}
     await reply(update, head + "\n".join(lines) + "\n\nSalvo quelli trovati?", reply_markup=InlineKeyboardMarkup([[
@@ -1136,6 +1140,76 @@ async def cb_lookup_session_answer(update: Update, ctx: ContextTypes.DEFAULT_TYP
     await q.edit_message_reply_markup(None)
     await ctx.bot.send_message(q.message.chat.id, f"✅ Salvati {saved} risultati.")
     await _ask_next(ctx, q.message.chat.id, sid, "m", 0)
+
+
+# ---------------------------------------------------------------- incolla risultati (diretta.it)
+
+PASTE_HINT = ("📋 Oppure copia i risultati da diretta.it (sezione Risultati del torneo) "
+              "e incollali qui in chat: il bot li abbina da solo alle partite.")
+
+
+async def on_pasted_results(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Testo incollato in privato dall'admin: se contiene risultati, li abbina alle partite senza risultato
+    delle sessioni recenti e propone ✅ Salva. Ritorna False se il testo non sembra un elenco di risultati."""
+    results, skipped = livescore.parse_diretta(update.effective_message.text)
+    if not results:
+        return False
+    d = db(ctx)
+    now = now_utc()
+    sessions = [s for s in await d.list_sessions(20, by_start=True)
+                if now - timedelta(days=4) <= s.starts_at <= now + timedelta(days=1)]
+    missing = [m for s in sessions for m in await d.get_matches(s.id) if m.winner is None]
+    found = livescore.match_results(missing, results)
+    note = f"\n({skipped} partite non ancora finite, saltate)" if skipped else ""
+    if not found:
+        await reply(update, f"📋 Ho letto {len(results)} risultati ma nessuno corrisponde a una partita senza "
+                            f"risultato delle sessioni di questi giorni.{note}\nControlla con /sessioni.")
+        return True
+    names = {s.id: s.name for s in sessions}
+    by_session: dict[int, list[str]] = {}
+    for m in missing:
+        if m.id in found:
+            by_session.setdefault(m.session_id, []).append(_found_text(m, found[m.id]))
+    blocks = [f"📁 <b>{escape(names[sid])}</b>\n" + "\n".join(lines) for sid, lines in by_session.items()]
+    ctx.user_data["paste"] = {m_id: [f.winner, f.score1, f.score2] for m_id, f in found.items()}
+    unmatched = len(results) - len(found)
+    extra = f"\n({unmatched} righe senza partita corrispondente)" if unmatched > 0 else ""
+    await reply(update, f"📋 Trovati {len(found)} risultati:\n\n" + "\n\n".join(blocks) + note + extra
+                + "\n\nLi salvo?", reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(f"✅ Salva {len(found)}", callback_data="lpok"),
+                    InlineKeyboardButton("❌ Annulla", callback_data="lpno")]]))
+    return True
+
+
+async def cb_paste_answer(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not is_admin(update, ctx):
+        await q.answer("Solo admin", show_alert=True)
+        return
+    pending = ctx.user_data.pop("paste", None)
+    await q.answer()
+    await q.edit_message_reply_markup(None)
+    if q.data == "lpno" or not pending:
+        await ctx.bot.send_message(q.message.chat.id, "Nessun risultato salvato." if q.data == "lpno"
+                                   else "Testo scaduto: incollalo di nuovo.")
+        return
+    d = db(ctx)
+    saved, sessions = 0, []
+    for mid, r in pending.items():
+        m = await d.get_match(int(mid))
+        if m and m.winner is None:  # nel frattempo non è stato messo a mano
+            await d.set_winner(m.id, *r)
+            saved += 1
+            if m.session_id not in sessions:
+                sessions.append(m.session_id)
+    await ctx.bot.send_message(q.message.chat.id, f"✅ Salvati {saved} risultati.")
+    for sid in sessions:
+        left = sum(m.winner is None for m in await d.get_matches(sid))
+        if left == 0:
+            await _ask_next(ctx, q.message.chat.id, sid, "m", 0)  # tutte fatte: propone di pubblicare
+        else:
+            await ctx.bot.send_message(q.message.chat.id, f"Sessione #{sid}: mancano ancora {left} risultati "
+                                                          f"(/risultati_sessione {sid}).")
 
 
 # ---------------------------------------------------------------- step 4: classifiche
@@ -1851,6 +1925,7 @@ def setup(app: Application) -> None:
     app.add_handler(CallbackQueryHandler(cb_lookup_match, pattern=r"^lr:"))
     app.add_handler(CallbackQueryHandler(cb_lookup_match_answer, pattern=r"^l(ok|no):"))
     app.add_handler(CallbackQueryHandler(cb_lookup_session_answer, pattern=r"^ls(ok|no):"))
+    app.add_handler(CallbackQueryHandler(cb_paste_answer, pattern=r"^lp(ok|no)$"))
     app.add_handler(CallbackQueryHandler(cb_publish, pattern=r"^pub:"))
     app.add_handler(CallbackQueryHandler(cb_ranking, pattern=r"^rk:"))
     app.add_handler(CallbackQueryHandler(cb_matches_to_group, pattern=r"^ptg:"))
