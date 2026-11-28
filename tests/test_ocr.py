@@ -107,7 +107,7 @@ def _draw(rows, scores=None, times=None) -> bytes:
     return buf.getvalue()
 
 
-@pytest.mark.skipif(not ocr.available(), reason="tesseract non installato")
+@pytest.mark.skipif(not ocr.available(), reason="tesserocr non installato")
 def test_tesseract_real_image():
     rows = [("Greaves B.", "Kist C."), ("Bialecki S.", "Wattimena J."), ("van Gerwen M.", "Labanauskas D.")]
     got = ocr.read_image_sync(_draw(rows, scores=[(6, 3), (5, 6), (6, 2)]))

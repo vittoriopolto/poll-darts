@@ -17,18 +17,13 @@ import asyncio
 import io
 import logging
 import re
-import shutil
-import subprocess
-import tempfile
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from .livescore import _tokens, name_score
 
 log = logging.getLogger(__name__)
-
-TIMEOUT = 60
-
 
 class OcrError(Exception):
     """Tesseract mancante o immagine illeggibile."""
@@ -79,7 +74,7 @@ def _clean(text: str) -> str:
 
 def parse_tsv(tsv: str) -> list[Word]:
     words = []
-    for line in tsv.splitlines()[1:]:
+    for line in tsv.splitlines():  # la riga di intestazione (se c'è) viene scartata sotto
         cols = line.split("\t")
         if len(cols) < 12 or not cols[11].strip():
             continue
@@ -117,10 +112,12 @@ def _rows(words: list[Word]) -> list[list[Word]]:
     return rows
 
 
-def _name_from(words: list[Word]) -> tuple[str, int, int] | None:
-    """Parole di una riga -> ("Brooks B.", indice di inizio, indice dopo il nome) se la riga inizia con un nome di giocatore.
+def _name_candidates(words: list[Word]) -> list[tuple[str, int, int]]:
+    """Parole di una riga -> possibili nomi di giocatore ("Brooks B.", indice di inizio, indice dopo il nome).
 
-    Davanti al nome possono esserci simboli letti male (bandiera, stellina): si saltano."""
+    Davanti al nome possono esserci simboli letti male (bandiera, stellina, a volte una parola come "Fra"):
+    per ogni punto di partenza si prova a leggere un nome; quale tenere lo decide l'allineamento a sinistra."""
+    out = []
     for start in range(min(len(words), 4)):
         toks: list[str] = []
         for i in range(start, len(words)):
@@ -132,14 +129,15 @@ def _name_from(words: list[Word]) -> tuple[str, int, int] | None:
                 if surname[0][0].islower() and surname[0].lower() not in PARTICLES:
                     break
                 ini = t if t.endswith(".") else t + "."
-                return " ".join(surname + [ini]), start, i + 1
+                out.append((" ".join(surname + [ini]), start, i + 1))
+                break
             # niente parole tutte maiuscole ("WS", "LIVE"): sono simboli letti male, non cognomi
             if (_SURNAME.match(t) and not t.isupper() and (t[0].isupper() or t.lower() in PARTICLES)
                     and len(toks) < 4):
                 toks.append(t)
                 continue
             break
-    return None
+    return out
 
 
 @dataclass
@@ -157,11 +155,19 @@ def parse_words(words: list[Word], width: int, score_reader=None) -> list[ShotMa
 
     `score_reader(cy, h)`, se c'è, rilegge i punti di una riga di nome in cui la prima lettura non li ha trovati
     (Tesseract salta spesso le cifre isolate)."""
+    rows = _rows(words)
+    cands = {id(row): [c for c in _name_candidates(row) if row[c[1]].left < width * 0.6] for row in rows}
+    lefts = sorted(row[c[1]].left for row in rows for c in cands[id(row)])
+    if not lefts:
+        return []
+    # colonna dei nomi: la posizione a sinistra più frequente (a meno di qualche pixel)
+    tol = width * 0.03
+    column = max(lefts, key=lambda x: sum(abs(y - x) <= tol for y in lefts))
     names: list[_NameRow] = []
     loose: list[Word] = []  # parole fuori dai nomi: orari, "11 L", punti su righe separate
-    for row in _rows(words):
-        got = _name_from(row)
-        if got and row[got[1]].left < width * 0.6:
+    for row in rows:
+        got = next((c for c in cands[id(row)] if abs(row[c[1]].left - column) <= tol * 2), None)
+        if got:
             name, start, nxt = got
             part = row[start:nxt]
             h = max(w.height for w in part)
@@ -179,10 +185,6 @@ def parse_words(words: list[Word], width: int, score_reader=None) -> list[ShotMa
             loose.extend(row)
     if not names:
         return []
-    # le righe dei nomi devono essere allineate a sinistra: scarta testi pubblicitari altrove
-    lefts = sorted(n.left for n in names)
-    med = lefts[len(lefts) // 2]
-    names = [n for n in names if abs(n.left - med) <= width * 0.06]
     names.sort(key=lambda n: n.cy)
     gaps = [b.cy - a.cy for a, b in zip(names, names[1:])]
     if not gaps:
@@ -215,7 +217,7 @@ def parse_words(words: list[Word], width: int, score_reader=None) -> list[ShotMa
     return out
 
 
-def _prepare(data: bytes) -> bytes:
+def _prepare(data: bytes):
     """Scala di grigi, chiaro su scuro -> scuro su chiaro, ingrandisce le immagini piccole."""
     from PIL import Image, ImageOps
 
@@ -226,67 +228,63 @@ def _prepare(data: bytes) -> bytes:
     if im.width < 1000:
         k = 1000 / im.width
         im = im.resize((1000, int(im.height * k)), Image.LANCZOS)
-    buf = io.BytesIO()
-    im.save(buf, format="PNG")
-    return buf.getvalue()
+    return im
+
+
+# Tesseract arriva dentro il pacchetto pip "tesserocr" (niente da installare sul server, va bene il runtime
+# Python di Render); il modello della lingua inglese è in assets/tessdata.
+TESSDATA = Path(__file__).resolve().parent.parent / "assets" / "tessdata"
+_lock = threading.Lock()
 
 
 def available() -> bool:
-    return shutil.which("tesseract") is not None
-
-
-def _run(data: bytes) -> tuple[str, int]:
-    if not available():
-        raise OcrError("Tesseract non è installato sul server.")
-    from PIL import Image
-
     try:
-        png = _prepare(data)
-    except Exception as e:
-        raise OcrError(f"immagine non valida ({e})") from e
-    width = Image.open(io.BytesIO(png)).width
-    with tempfile.TemporaryDirectory() as tmp:
-        path = Path(tmp) / "shot.png"
-        path.write_bytes(png)
-        try:
-            res = subprocess.run(["tesseract", str(path), "stdout", "--psm", "11", "-l", "eng", "tsv"],
-                                 capture_output=True, timeout=TIMEOUT, check=True)
-        except subprocess.TimeoutExpired as e:
-            raise OcrError("lettura troppo lenta") from e
-        except subprocess.CalledProcessError as e:
-            raise OcrError(e.stderr.decode(errors="replace")[-200:]) from e
-    return res.stdout.decode("utf-8", errors="replace"), width
+        import tesserocr  # noqa: F401
+    except ImportError:
+        return False
+    return (TESSDATA / "eng.traineddata").exists()
 
 
-def _digits(png: bytes, cy: float, h: float) -> int | None:
-    """Punti a destra di un nome: ritaglia la riga (senza il riquadro LIVE in fondo) e legge solo cifre."""
-    from PIL import Image
+def _api(psm: int):
+    import tesserocr
 
-    im = Image.open(io.BytesIO(png))
-    box = (int(im.width * 0.5), max(0, int(cy - h * 0.9)), int(im.width * 0.9), min(im.height, int(cy + h * 0.9)))
-    crop = im.crop(box)
-    if crop.getextrema()[0] > 200:  # riga vuota
-        return None
-    buf = io.BytesIO()
-    crop.save(buf, format="PNG")
-    with tempfile.TemporaryDirectory() as tmp:
-        path = Path(tmp) / "row.png"
-        path.write_bytes(buf.getvalue())
-        try:
-            res = subprocess.run(["tesseract", str(path), "stdout", "--psm", "7", "-l", "eng",
-                                  "-c", "tessedit_char_whitelist=0123456789:"],
-                                 capture_output=True, timeout=TIMEOUT, check=True)
-        except (subprocess.SubprocessError, OSError):
-            return None
-    toks = res.stdout.decode(errors="replace").split()
-    nums = [t for t in toks if _SCORE.match(t)]
-    return int(nums[-1]) if nums and int(nums[-1]) <= 30 else None
+    return tesserocr.PyTessBaseAPI(path=str(TESSDATA), lang="eng", psm=psm)
 
 
 def read_image_sync(data: bytes) -> list[ShotMatch]:
-    tsv, width = _run(data)
-    png = _prepare(data)
-    return parse_words(parse_tsv(tsv), width, score_reader=lambda cy, h: _digits(png, cy, h))
+    if not available():
+        raise OcrError("l'OCR (tesserocr) non è installato sul server.")
+    import tesserocr
+
+    try:
+        im = _prepare(data)
+    except Exception as e:
+        raise OcrError(f"immagine non valida ({e})") from e
+    with _lock:  # una lettura alla volta: poca RAM sul piano free
+        api = _api(tesserocr.PSM.SPARSE_TEXT)
+        digits = _api(tesserocr.PSM.SINGLE_LINE)
+        digits.SetVariable("tessedit_char_whitelist", "0123456789:")
+        try:
+            api.SetImage(im)
+            api.SetSourceResolution(300)  # senza, Tesseract perde gli "1" sottili (14:00 -> 4:00)
+            tsv = api.GetTSVText(0)
+
+            def score_reader(cy: float, h: float) -> int | None:
+                """Punti a destra di un nome: ritaglia la riga (senza il riquadro LIVE) e legge solo cifre."""
+                box = (int(im.width * 0.5), max(0, int(cy - h * 0.9)), int(im.width * 0.9),
+                       min(im.height, int(cy + h * 0.9)))
+                crop = im.crop(box)
+                if crop.getextrema()[0] > 200:  # riga vuota
+                    return None
+                digits.SetImage(crop)
+                digits.SetSourceResolution(300)
+                nums = [t for t in digits.GetUTF8Text().split() if _SCORE.match(t)]
+                return int(nums[-1]) if nums and int(nums[-1]) <= 30 else None
+
+            return parse_words(parse_tsv(tsv), im.width, score_reader=score_reader)
+        finally:
+            api.End()
+            digits.End()
 
 
 async def read_image(data: bytes) -> list[ShotMatch]:

@@ -28,7 +28,7 @@ Stack: Python 3.12 · python-telegram-bot 22 · Postgres (Neon) · deploy su Ren
 | privato (admin) | `/risultato_partita ID` | dà o corregge il risultato di una sola partita (bottoni come in `/risultati_sessione`, più *Annulla*) |
 | privato (admin) | `/cerca_risultati ID` | cerca su TheSportsDB i risultati mancanti della sessione e li salva con un tasto (anche dal link 🔎 in `/sessioni`); sotto *Chi ha vinto?* c'è il tasto 🔎 *Cerca risultato* per una sola partita |
 | privato (admin) | *incolla testo* | incolla in chat i risultati copiati da diretta.it (blocchi Finale / giocatore / giocatore / punti / punti): il bot li abbina alle partite senza risultato delle sessioni di questi giorni e li salva con ✅ |
-| privato (admin) | 📷 *screenshot* | mandi uno o più screenshot di diretta.it (anche un album; vanno bene sovrapposti). Il bot legge le partite con l'OCR gratuito Tesseract, salta quelle tagliate sul bordo e i doppioni. **Partite finite**: abbina i punteggi alle partite senza risultato e propone ✅ Salva, come per il testo incollato. **Partite da giocare**: dice quali sono 📌 già in una sessione (di 2 giorni fa fino a fra 3 giorni) e propone 🆕 *Crea sessione* con le altre |
+| privato (admin) | 📷 *screenshot* | mandi uno o più screenshot di diretta.it (anche un album; vanno bene sovrapposti). Il bot legge le partite con l'OCR gratuito Tesseract (pacchetto `tesserocr`), salta quelle tagliate sul bordo e i doppioni. **Partite finite**: abbina i punteggi alle partite senza risultato e propone ✅ Salva, come per il testo incollato. **Partite da giocare**: dice quali sono 📌 già in una sessione (di 2 giorni fa fino a fra 3 giorni) e propone 🆕 *Crea sessione* con le altre |
 | privato (admin) | `/crea_sessione` + 📷 | al punto 2, invece del testo, manda gli screenshot: arriva l'elenco con ✅ (nomi riconosciuti) o ⚠️ (nome nuovo o incerto), i tasti ✏️ N per correggere e 🗑 N per togliere, ➡️ *Avanti*; al punto 3 c'è il tasto con l'orario della prima partita. Le partite già in una sessione non vengono aggiunte |
 | privato (admin) | (punteggio) | quando il bot chiede *Chi ha vinto?*: **1)** tocchi il vincitore, poi i tasti 1️⃣–9️⃣ con i suoi punti, poi quelli del perdente (0️⃣ fino a uno meno del vincitore; c'è anche *Senza punteggio*); **2)** oppure scrivi i punti `2 3` (giocatore 1, spazio, giocatore 2) e il vincitore lo capisce da solo |
 | privato o gruppo (admin) | `/partite ID` | in testo: 🏆 nome evento, 📁 nome sessione, ⏰ orario di inizio e l'elenco delle partite (✓ giocata, con vincitore e punteggio in grassetto · ○ da giocare · 🚫 non disputata). In privato poi chiede con un bottone se mandarlo nel gruppo (quello in cui è stata lanciata la sessione, altrimenti quello dell'ultima sessione lanciata, altrimenti il gruppo in cui il bot ha visto attività più di recente); nel gruppo cancella il comando e lo manda come messaggio a sé |
@@ -110,10 +110,10 @@ Pubblica questa cartella in un repository GitHub (privato va benissimo).
 
 ### 4. Render
 1. [dashboard.render.com](https://dashboard.render.com) → **New → Blueprint** → scegli il repo:
-   legge `render.yaml` e crea il web service con il `Dockerfile` (serve Docker per installare Tesseract,
-   l'OCR degli screenshot). In alternativa *New → Web Service* con *Language* **Docker**.
-   Servizio già esistente in Python: *Settings → Build → Source → Edit*, scegli *Runtime* **Docker** e *Deploy*
-   (le variabili d'ambiente restano). Senza Docker il bot funziona lo stesso, ma non legge le foto.
+   legge `render.yaml` e crea il web service. (In alternativa *New → Web Service* con build
+   `pip install -r requirements.txt` e start `python -m pdc`.)
+   L'OCR degli screenshot (Tesseract) arriva col pacchetto pip `tesserocr` e il modello in `assets/tessdata`:
+   non serve installare niente su Render.
 2. Imposta le variabili: `BOT_TOKEN`, `DATABASE_URL`, `ADMIN_IDS`.
 3. Al deploy il bot registra da solo il webhook su `https://<tuo-servizio>.onrender.com/telegram`.
 
@@ -173,8 +173,8 @@ pdc/
   ocr.py        lettura screenshot di diretta.it (Tesseract) e abbinamento dei nomi
 assets/logo.jpg logo PDC180 (usato nelle immagini)
 assets/fonts    DejaVu Sans e Liberation Sans (licenze libere)
-render.yaml     configurazione Render (Docker)
-Dockerfile      Python + Tesseract
+render.yaml     configurazione Render
+assets/tessdata modello inglese di Tesseract (OCR degli screenshot)
 ```
 
 Punteggio: +1 per ogni voto uguale al vincitore. Pari merito stile sportivo (1, 1, 3…). Le partite
