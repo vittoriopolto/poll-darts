@@ -853,3 +853,123 @@ async def scenario_bracket():
 
 def test_bracket_flow():
     asyncio.run(scenario_bracket())
+
+
+async def scenario_shots(monkeypatch):
+    """Screenshot di diretta.it: partite già presenti, nuove (crea sessione con modifica/cancella) e risultati."""
+    import asyncpg
+    from pdc import ocr
+    from pdc.ocr import ShotMatch
+    con = await asyncpg.connect(DSN)
+    await con.execute("DROP TABLE IF EXISTS brackets, feedback_answers, feedback_options, feedback_questions, feedback_pools, votes, matches, sessions, events, group_members, users CASCADE")
+    await con.close()
+    cfg = Config(bot_token="1:x", database_url=DSN, admin_ids=frozenset({ADMIN}), tz=TZ, public_url=None,
+                 port=0, webhook_secret="s", close_minutes_before=5, cover_title="PDC180 POLL", mute_mode="invio")
+    database = await DB.connect(DSN, 5)
+    bot = FakeBot()
+    old = datetime.now(TZ) - timedelta(days=20)
+    await database.create_session("1° turno vecchio", old, ADMIN,
+                                  [("Sebastian Białecki", "Jermaine Wattimena"), ("Kim Huybrechts", "Ryan Joyce")])
+    start = datetime.now(TZ).replace(microsecond=0) + timedelta(hours=1)
+    sid = await database.create_session("2° turno", start, ADMIN,
+                                        [("Bradley Brooks", "Kim Huybrechts"), ("Michael Smith", "Niels Zonneveld")])
+
+    shots = [[ShotMatch("Brooks B.", "Huybrechts K.", time="14:00"), ShotMatch("Smith M.", "Zonneveld N.", time="14:00"),
+              ShotMatch("Bialecki S.", "Rock J.", time="14:30")],
+             # secondo screenshot sovrapposto: la partita di Białecki c'è di nuovo
+             [ShotMatch("Bialecki S.", "Rock J.", time="14:30"), ShotMatch("Pietreczko R.", "Joyce R.", time="15:00")]]
+    reads = iter(shots)
+
+    async def fake_bytes(update):
+        return b"png"
+
+    async def fake_read(data):
+        return next(reads)
+    monkeypatch.setattr(h, "_photo_bytes", fake_bytes)
+    monkeypatch.setattr(ocr, "read_image", fake_read)
+
+    ctx = make_ctx(bot, cfg, database)
+    upd, _ = make_update()
+    await h.on_photo(upd, ctx)
+    upd, _ = make_update()
+    await h.on_photo(upd, ctx)
+    report = bot.calls[-1][1][1]
+    assert "Ho letto 4 partite da giocare nelle 2 foto" in report, report
+    assert "Già presenti (2)" in report and f"#{sid} 2° turno" in report
+    assert "Non ancora in una sessione (2)" in report
+    assert "Sebastian Białecki - Rock J. <i>(nuovo)</i>" in report  # nome salvato + giocatore nuovo
+    assert "Pietreczko R. <i>(nuovo)</i> - Ryan Joyce" in report
+    assert bot.calls[-1][2]["reply_markup"].inline_keyboard[0][0].callback_data == "shot:new"
+
+    # crea la sessione con le nuove
+    upd, _ = make_cb("shot:new")
+    assert await h.new_session_from_shots(upd, ctx) == h.ASK_NAME
+    upd, _ = make_update(text="Sabato sera")
+    assert await h.new_session_name(upd, ctx) == h.ASK_MATCHES
+    draft = bot.calls[-1][1][1]
+    assert "1. ⚠️ Sebastian Białecki - Rock J." in draft and "· 14:30" in draft and "2. ⚠️ Pietreczko" in draft
+    # correggo la 2 e tolgo la 1
+    upd, rep = make_cb("nd:e:2")
+    assert await h.new_session_draft_cb(upd, ctx) == h.ASK_MATCHES
+    upd, rep = make_update(text="Ricardo Pietreczko - Joyce R.")
+    assert await h.new_session_matches(upd, ctx) == h.ASK_MATCHES
+    assert "2. ✅ Ricardo Pietreczko - Ryan Joyce · 15:00" not in bot.calls[-1][1][1]  # Pietreczko è nuovo
+    assert "2. ⚠️ Ricardo Pietreczko <i>(nuovo)</i> - Ryan Joyce · 15:00" in bot.calls[-1][1][1]
+    upd, edits = make_cb("nd:d:1")
+    assert await h.new_session_draft_cb(upd, ctx) == h.ASK_MATCHES
+    assert "1. ⚠️ Ricardo Pietreczko" in edits[0] and "Białecki" not in edits[0]
+    # una partita scritta a mano si aggiunge all'elenco (i nomi conosciuti diventano quelli salvati)
+    upd, rep = make_update(text="Smith M. - Wattimena J.")
+    await h.new_session_matches(upd, ctx)
+    assert "2. ✅ Michael Smith - Jermaine Wattimena" in bot.calls[-1][1][1]
+    upd, rep = make_cb("nd:ok")
+    assert await h.new_session_draft_cb(upd, ctx) == h.ASK_START
+    upd, _ = make_cb("nt:15:00")
+    assert await h.new_session_time_cb(upd, ctx) == h.ASK_CONFIRM
+    upd, edits = make_cb("new:save")
+    await h.new_session_confirm(upd, ctx)
+    new_sid = sid + 1
+    assert f"ID sessione: <b>{new_sid}</b>" in edits[0]
+    ms = await database.get_matches(new_sid)
+    assert [(m.player1, m.player2) for m in ms] == [("Ricardo Pietreczko", "Ryan Joyce"),
+                                                   ("Michael Smith", "Jermaine Wattimena")]
+    s = await database.get_session(new_sid)
+    assert s.starts_at.astimezone(TZ).strftime("%H:%M") == "15:00"
+
+    # dentro /crea_sessione: foto al punto 2, le partite già presenti non entrano
+    reads = iter([[ShotMatch("Brooks B.", "Huybrechts K."), ShotMatch("Price G.", "Cross R.")]])
+    ctx2 = make_ctx(bot, cfg, database)
+    upd, _ = make_update()
+    await h.new_session_start(upd, ctx2)
+    upd, _ = make_update(text="Prova")
+    await h.new_session_name(upd, ctx2)
+    upd, _ = make_update()
+    assert await h.new_session_photo(upd, ctx2) == h.ASK_MATCHES
+    txt = bot.calls[-1][1][1]
+    assert "1. ⚠️ Price G. <i>(nuovo)</i> - Cross R. <i>(nuovo)</i>" in txt
+    assert "Già nelle sessioni, non aggiunte (1)" in txt and "Bradley Brooks - Kim Huybrechts" in txt
+
+    # screenshot con partite finite: risultati da salvare
+    reads = iter([[ShotMatch("Brooks B.", "Huybrechts K.", 4, 6), ShotMatch("Zonneveld N.", "Smith M.", 6, 2),
+                   ShotMatch("Labanauskas D.", "van Gerwen M.", 6, 5)]])
+    ctx3 = make_ctx(bot, cfg, database)
+    upd, _ = make_update()
+    await h.on_photo(upd, ctx3)
+    txt = bot.calls[-1][1][1]
+    assert "Trovati 2 risultati" in txt and "1 partite lette non sono tra quelle senza risultato" in txt, txt
+    upd, _ = make_cb("lpok")
+    await h.cb_paste_answer(upd, ctx3)
+    a, b = await database.get_matches(sid)
+    assert (a.winner, a.score1, a.score2) == (2, 4, 6) and (b.winner, b.score1, b.score2) == (2, 2, 6)
+
+    # di nuovo le stesse partite da giocare: ci sono già tutte
+    reads = iter([[ShotMatch("Brooks B.", "Huybrechts K.", time="14:00")]])
+    ctx4 = make_ctx(bot, cfg, database)
+    upd, _ = make_update()
+    await h.on_photo(upd, ctx4)
+    assert "Ci sono già tutte" in bot.calls[-1][1][1]
+    await database.close()
+
+
+def test_shots_flow(monkeypatch):
+    asyncio.run(scenario_shots(monkeypatch))
