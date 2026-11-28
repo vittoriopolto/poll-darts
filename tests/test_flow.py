@@ -855,6 +855,17 @@ def test_bracket_flow():
     asyncio.run(scenario_bracket())
 
 
+def make_cb_replies(data):
+    """Come make_cb, ma raccoglie anche i messaggi mandati in risposta (reply_text)."""
+    upd, edits = make_cb(data)
+    replies = []
+
+    async def reply_text(t, **kw):
+        replies.append(t)
+    upd.effective_message.reply_text = reply_text
+    return upd, replies
+
+
 async def scenario_shots(monkeypatch):
     """Screenshot di diretta.it: partite già presenti, nuove (crea sessione con modifica/cancella) e risultati."""
     import asyncpg
@@ -874,7 +885,7 @@ async def scenario_shots(monkeypatch):
     sid = await database.create_session("2° turno", start, ADMIN,
                                         [("Bradley Brooks", "Kim Huybrechts"), ("Michael Smith", "Niels Zonneveld")])
 
-    shots = [[ShotMatch("Brooks B.", "Huybrechts K.", time="14:00"), ShotMatch("Smith M.", "Zonneveld N.", time="14:00"),
+    shots = [[ShotMatch("Brooks B.", "Hi Huybrechts K.", time="14:00"), ShotMatch("Smith M.", "Zonneveld N.", time="14:00"),
               ShotMatch("Bialecki S.", "Rock J.", time="14:30")],
              # secondo screenshot sovrapposto: la partita di Białecki c'è di nuovo
              [ShotMatch("Bialecki S.", "Rock J.", time="14:30"), ShotMatch("Pietreczko R.", "Joyce R.", time="15:00")]]
@@ -899,7 +910,35 @@ async def scenario_shots(monkeypatch):
     assert "Non ancora in una sessione (2)" in report
     assert "Sebastian Białecki - Rock J. <i>(nuovo)</i>" in report  # nome salvato + giocatore nuovo
     assert "Pietreczko R. <i>(nuovo)</i> - Ryan Joyce" in report
-    assert bot.calls[-1][2]["reply_markup"].inline_keyboard[0][0].callback_data == "shot:new"
+    kb = bot.calls[-1][2]["reply_markup"].inline_keyboard
+    assert [b.callback_data for b in kb[0]] == ["fx:s:1:0:m", "fx:s:2:0:m"] and kb[-1][0].callback_data == "shot:new"
+    # ✏️ sulla 2 del resoconto: Joyce R. era già riconosciuto, Pietreczko è nuovo: lo ignoro e poi torno
+    upd, rep = make_cb_replies("fx:s:1:0:m")
+    await h.cb_fix(upd, ctx)
+    assert "Partita 1" in rep[0] and "Sebastian Białecki" in rep[0]
+    # una partita con nome incerto: scelgo il suggerito e diventa "già presente"
+    ctx.user_data["shot_new"].append({"p1": "Smith J.", "p2": "Zonneveld N.", "st1": "unsure", "st2": "unsure",
+                                      "h1": "Michael Smith", "h2": "Niels Zonneveld", "r1": "Smith J.",
+                                      "r2": "Zonneveld N.", "time": None})
+    upd, edits = make_cb("fx:s:3:2:r")  # giocatore 2: tengo "Zonneveld N." come letto
+    await h.cb_fix(upd, ctx)
+    # col suggerito del giocatore 1 (Michael Smith) la partita è già nella sessione: tolta
+    assert f"è già nella sessione #{sid}" in edits[-1] and "(2)" in edits[-1]
+    assert len(ctx.user_data["shot_new"]) == 2
+    ctx.user_data["shot_new"].append({"p1": "Price G.", "p2": "Smith J.", "st1": "new", "st2": "unsure",
+                                      "h1": None, "h2": "Michael Smith", "r1": "Price G.", "r2": "Smith J.",
+                                      "time": None})
+    upd, rep = make_cb_replies("fx:s:3:0:m")
+    await h.cb_fix(upd, ctx)
+    kb = h._fix_menu(ctx.user_data["shot_new"][2], "s", 3)[1].inline_keyboard
+    assert [b.text for b in kb[0]] == ["📝 Price G.", "⌨️ Scrivi G1"]
+    assert [b.text for b in kb[1]] == ["✅ Michael Smith", "📝 Smith J.", "⌨️ Scrivi G2"]
+    upd, edits = make_cb("fx:s:3:2:h")
+    await h.cb_fix(upd, ctx)
+    assert "Partita 3" in edits[-1] and "Michael Smith" in edits[-1]  # resta il menu: Price è nuovo
+    upd, edits = make_cb("fx:s:3:0:x")
+    await h.cb_fix(upd, ctx)
+    assert "Ignorata: Price G. - Michael Smith" in edits[-1] and len(ctx.user_data["shot_new"]) == 2
 
     # crea la sessione con le nuove
     upd, _ = make_cb("shot:new")
@@ -908,16 +947,19 @@ async def scenario_shots(monkeypatch):
     assert await h.new_session_name(upd, ctx) == h.ASK_MATCHES
     draft = bot.calls[-1][1][1]
     assert "1. ⚠️ Sebastian Białecki - Rock J." in draft and "· 14:30" in draft and "2. ⚠️ Pietreczko" in draft
-    # correggo la 2 e tolgo la 1
-    upd, rep = make_cb("nd:e:2")
-    assert await h.new_session_draft_cb(upd, ctx) == h.ASK_MATCHES
-    upd, rep = make_update(text="Ricardo Pietreczko - Joyce R.")
+    # ✏️ sulla 2: menu con le scelte, poi scrivo a mano il giocatore 1
+    upd, rep = make_cb_replies("fx:d:2:0:m")
+    await h.cb_fix(upd, ctx)
+    assert "Partita 2" in rep[0] and "⚠️ nome nuovo" in rep[0]
+    upd, rep = make_cb_replies("fx:d:2:1:t")
+    await h.cb_fix(upd, ctx)
+    assert "Scrivi il nome del giocatore 1" in rep[0]
+    upd, rep = make_update(text="Ricardo Pietreczko")
     assert await h.new_session_matches(upd, ctx) == h.ASK_MATCHES
-    assert "2. ✅ Ricardo Pietreczko - Ryan Joyce · 15:00" not in bot.calls[-1][1][1]  # Pietreczko è nuovo
-    assert "2. ⚠️ Ricardo Pietreczko <i>(nuovo)</i> - Ryan Joyce · 15:00" in bot.calls[-1][1][1]
+    assert "2. ✅ Ricardo Pietreczko - Ryan Joyce · 15:00" in rep[0], rep[0]
     upd, edits = make_cb("nd:d:1")
     assert await h.new_session_draft_cb(upd, ctx) == h.ASK_MATCHES
-    assert "1. ⚠️ Ricardo Pietreczko" in edits[0] and "Białecki" not in edits[0]
+    assert "1. ✅ Ricardo Pietreczko" in edits[0] and "Białecki" not in edits[0]
     # una partita scritta a mano si aggiunge all'elenco (i nomi conosciuti diventano quelli salvati)
     upd, rep = make_update(text="Smith M. - Wattimena J.")
     await h.new_session_matches(upd, ctx)

@@ -1186,6 +1186,8 @@ def _await_score(ctx: ContextTypes.DEFAULT_TYPE, match_id: int, mode: str, msg) 
 async def on_score_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """In privato: '6-4' scritto dopo la domanda 'Chi ha vinto?' salva vincitore e punteggio."""
     msg = update.effective_message
+    if await _fix_typed(update, ctx):
+        return
     if msg and msg.text and msg.text.count("\n") >= 3 and is_admin(update, ctx):
         if await on_pasted_results(update, ctx):
             return
@@ -1542,13 +1544,21 @@ async def _recent_matches(ctx: ContextTypes.DEFAULT_TYPE) -> list[tuple[Match, S
 def _resolve_pair(p1: str, p2: str, known: list[str], time_: str | None = None) -> dict:
     r1, r2 = ocr.resolve_name(p1, known), ocr.resolve_name(p2, known)
     return {"p1": r1.name, "p2": r2.name, "st1": r1.status, "st2": r2.status, "h1": r1.hint, "h2": r2.hint,
-            "time": time_}
+            "r1": r1.read, "r2": r2.read, "time": time_}
 
 
 def _present(item: dict, existing: list[tuple[Match, Session]]) -> Session | None:
+    """Sessione che ha già questa partita (provando anche i nomi suggeriti per quelli incerti)."""
+    def names(k: str) -> list[str]:
+        out = [item[f"p{k}"]]
+        if item.get(f"st{k}") == "unsure" and item.get(f"h{k}"):
+            out.append(item[f"h{k}"])
+        return out
     for m, s in existing:
-        if ocr.same_match(item["p1"], item["p2"], m.player1, m.player2):
-            return s
+        for a in names("1"):
+            for b in names("2"):
+                if ocr.same_match(a, b, m.player1, m.player2):
+                    return s
     return None
 
 
@@ -1578,11 +1588,12 @@ def _draft_message(data: dict) -> tuple[str, InlineKeyboardMarkup]:
         extra = (f"\n\n📌 Già nelle sessioni, non aggiunte ({len(present)}):\n"
                  + "\n".join(f"• {escape(p)}" for p in present))
     help_ = ("\n\n✅ = nomi già conosciuti dal bot · ⚠️ = nome nuovo o incerto: controllalo.\n"
-             "Tocca ✏️ per correggere una partita, 🗑 per toglierla. Puoi mandare altre foto o scrivere altre "
+             "Tocca ✏️ per scegliere il nome giusto (letto, suggerito o scritto a mano) o ignorare la partita, "
+             "🗑 per toglierla subito. Puoi mandare altre foto o scrivere altre "
              "partite (<code>GIOCATORE 1 - GIOCATORE 2</code>, una per riga).")
     rows, row = [], []
     for i in range(1, len(draft) + 1):
-        row += [InlineKeyboardButton(f"✏️ {i}", callback_data=f"nd:e:{i}"),
+        row += [InlineKeyboardButton(f"✏️ {i}", callback_data=f"fx:d:{i}:0:m"),
                 InlineKeyboardButton(f"🗑 {i}", callback_data=f"nd:d:{i}")]
         if len(row) == 8:
             rows.append(row)
@@ -1638,7 +1649,9 @@ async def new_session_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> i
 
 
 async def _draft_text_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    """Testo scritto mentre c'è l'elenco da screenshot: correzione di una partita (dopo ✏️) o partite in più."""
+    """Testo scritto mentre c'è l'elenco da screenshot: nome scritto a mano (dopo ✏️) o partite in più."""
+    if await _fix_typed(update, ctx):
+        return ASK_MATCHES
     data = ctx.user_data["new"]
     try:
         typed = parse_matches(update.message.text)
@@ -1647,12 +1660,7 @@ async def _draft_text_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> i
         return ASK_MATCHES
     known = await _known_names(ctx)
     items = [_resolve_pair(p1, p2, known) for p1, p2 in typed]
-    idx = data.pop("edit", None)
     draft = data["draft"]
-    if idx is not None and 0 <= idx < len(draft):
-        items[0]["time"] = draft[idx].get("time")
-        draft[idx] = items[0]
-        items = items[1:]
     for it in items:
         if not any(ocr.same_match(it["p1"], it["p2"], o["p1"], o["p2"]) for o in draft):
             draft.append(it)
@@ -1669,23 +1677,16 @@ async def new_session_draft_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -
     parts = q.data.split(":")
     action = parts[1]
     draft = data["draft"]
-    if action in ("e", "d"):
+    if action == "d":
         idx = int(parts[2]) - 1
         if not 0 <= idx < len(draft):
             await q.answer("Partita non trovata")
             return ASK_MATCHES
-        if action == "d":
-            del draft[idx]
-            data.pop("edit", None)
-            await q.answer("Tolta")
-            text, kb = _draft_message(data)
-            await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
-            return ASK_MATCHES
-        await q.answer()
-        data["edit"] = idx
-        it = draft[idx]
-        await reply(update, f"✏️ Scrivi la partita {idx + 1} corretta, es.\n"
-                            f"<code>{escape(it['p1'])} - {escape(it['p2'])}</code>")
+        del draft[idx]
+        ctx.user_data.pop("fix_typing", None)
+        await q.answer("Tolta")
+        text, kb = _draft_message(data)
+        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
         return ASK_MATCHES
     if action == "x":
         await q.answer()
@@ -1700,7 +1701,7 @@ async def new_session_draft_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -
     await q.answer()
     await q.edit_message_reply_markup(None)
     data["matches"] = [(it["p1"], it["p2"]) for it in draft]
-    data.pop("edit", None)
+    ctx.user_data.pop("fix_typing", None)
     c = cfg(ctx)
     times = sorted(it["time"] for it in draft if it.get("time"))
     kb = None
@@ -1727,6 +1728,7 @@ async def new_session_from_shots(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
         await reply(update, "Elenco scaduto: rimanda gli screenshot.")
         return ConversationHandler.END
     ctx.user_data["new"] = {"draft": drafts, "present": []}
+    ctx.user_data.pop("fix_typing", None)
     await reply(update, f"🆕 Nuova sessione con {len(drafts)} partite.\n\n1/3 – Come si chiama? "
                         "(es. <i>Sabato pomeriggio</i>)\n\n/annulla per uscire.")
     return ASK_NAME
@@ -1790,15 +1792,161 @@ async def _shots_report(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, user_data:
         lines += [f"• {escape(it['p1'])} - {escape(it['p2'])} → #{s.id} {escape(s.name)}" for it, s in present]
     kb = None
     if new:
-        lines.append(f"\n🆕 Non ancora in una sessione ({len(new)}):")
-        lines += [_draft_line(i, it) for i, (it, _) in enumerate(new, 1)]
         user_data["shot_new"] = [it for it, _ in new]
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"🆕 Crea sessione con queste {len(new)}",
-                                                         callback_data="shot:new")]])
+        text, kb = _shot_list(user_data)
+        lines.append("\n" + text)
     else:
         user_data.pop("shot_new", None)
         lines.append("\n✅ Ci sono già tutte, non serve creare niente.")
     await send("\n".join(lines), reply_markup=kb)
+
+
+def _shot_list(user_data: dict) -> tuple[str, InlineKeyboardMarkup | None]:
+    """Partite lette dagli screenshot e non ancora in una sessione, con ✏️ per ognuna e 🆕 Crea sessione."""
+    items = user_data.get("shot_new") or []
+    if not items:
+        return "Nessuna partita da creare.", None
+    lines = [f"🆕 Non ancora in una sessione ({len(items)}):"]
+    lines += [_draft_line(i, it) for i, it in enumerate(items, 1)]
+    if any(not (it["st1"] == it["st2"] == "ok") for it in items):
+        lines.append("\nTocca ✏️ N per scegliere il nome giusto o ignorare la partita.")
+    rows, row = [], []
+    for i in range(1, len(items) + 1):
+        row.append(InlineKeyboardButton(f"✏️ {i}", callback_data=f"fx:s:{i}:0:m"))
+        if len(row) == 8:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton(f"🆕 Crea sessione con queste {len(items)}", callback_data="shot:new")])
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+def _fix_items(user_data: dict, where: str) -> list[dict] | None:
+    if where == "s":
+        return user_data.get("shot_new")
+    data = user_data.get("new") or {}
+    return data.get("draft")
+
+
+def _list_view(user_data: dict, where: str) -> tuple[str, InlineKeyboardMarkup | None]:
+    if where == "s":
+        return _shot_list(user_data)
+    return _draft_message(user_data.get("new") or {})
+
+
+def _fix_menu(it: dict, where: str, i: int) -> tuple[str, InlineKeyboardMarkup]:
+    """Scelte per una partita: per ogni giocatore nome letto / suggerito / scritto a mano; ignora la partita."""
+    lines = [f"✏️ <b>Partita {i}</b>: {escape(it['p1'])} - {escape(it['p2'])}"]
+    rows = []
+    for k in ("1", "2"):
+        name, st, read, hint = it[f"p{k}"], it[f"st{k}"], it.get(f"r{k}") or it[f"p{k}"], it.get(f"h{k}")
+        desc = {"ok": "✅ riconosciuto", "new": "⚠️ nome nuovo", "unsure": "⚠️ incerto"}[st]
+        extra = f" (letto «{escape(read)}»)" if read != name else ""
+        if hint:
+            extra += f", forse <b>{escape(hint)}</b>"
+        lines.append(f"Giocatore {k}: {escape(name)} – {desc}{extra}")
+        row = []
+        if hint:
+            row.append(InlineKeyboardButton(f"✅ {hint}", callback_data=f"fx:{where}:{i}:{k}:h"))
+        if st != "ok" or read != name:
+            row.append(InlineKeyboardButton(f"📝 {read}", callback_data=f"fx:{where}:{i}:{k}:r"))
+        row.append(InlineKeyboardButton(f"⌨️ Scrivi G{k}", callback_data=f"fx:{where}:{i}:{k}:t"))
+        rows.append(row)
+    lines.append("\n✅ = usa il suggerito · 📝 = usa quello letto · ⌨️ = scrivilo a mano")
+    rows.append([InlineKeyboardButton("🗑 Ignora partita", callback_data=f"fx:{where}:{i}:0:x"),
+                 InlineKeyboardButton("↩️ Torna all'elenco", callback_data=f"fx:{where}:{i}:0:b")])
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+async def _after_fix(ctx: ContextTypes.DEFAULT_TYPE, user_data: dict, where: str, idx: int) -> str:
+    """Dopo una correzione: se ora la partita è già in una sessione la toglie (e lo dice)."""
+    items = _fix_items(user_data, where)
+    it = items[idx]
+    s = _present(it, await _recent_matches(ctx))
+    if s is None:
+        return ""
+    del items[idx]
+    label = f"{it['p1']} - {it['p2']} (#{s.id} {s.name})"
+    if where == "d":
+        present = user_data["new"].setdefault("present", [])
+        if label not in present:
+            present.append(label)
+    return f"📌 {escape(it['p1'])} - {escape(it['p2'])} è già nella sessione #{s.id} {escape(s.name)}: tolta.\n\n"
+
+
+async def cb_fix(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Tasti ✏️ sulle partite lette dagli screenshot (resoconto o elenco di /crea_sessione)."""
+    q = update.callback_query
+    if not is_admin(update, ctx):
+        await q.answer("Solo admin", show_alert=True)
+        return
+    _, where, num, slot, act = q.data.split(":")
+    items = _fix_items(ctx.user_data, where)
+    idx = int(num) - 1
+    if not items or not 0 <= idx < len(items):
+        await q.answer("Elenco scaduto o partita non trovata", show_alert=True)
+        return
+    it = items[idx]
+    if act == "m":
+        await q.answer()
+        text, kb = _fix_menu(it, where, idx + 1)
+        await reply(update, text, reply_markup=kb)
+        return
+    if act in ("b", "x"):
+        note = ""
+        if act == "x":
+            del items[idx]
+            note = f"🗑 Ignorata: {escape(it['p1'])} - {escape(it['p2'])}\n\n"
+        ctx.user_data.pop("fix_typing", None)
+        await q.answer()
+        text, kb = _list_view(ctx.user_data, where)
+        await q.edit_message_text(note + text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        return
+    if act == "t":
+        await q.answer()
+        ctx.user_data["fix_typing"] = {"where": where, "idx": idx, "slot": slot}
+        await reply(update, f"⌨️ Scrivi il nome del giocatore {slot} (ora: <code>{escape(it['p' + slot])}</code>).")
+        return
+    # h = suggerito, r = letto
+    if act == "h" and it.get(f"h{slot}"):
+        it[f"p{slot}"] = it[f"h{slot}"]
+    elif act == "r":
+        it[f"p{slot}"] = it.get(f"r{slot}") or it[f"p{slot}"]
+    it[f"st{slot}"], it[f"h{slot}"] = "ok", None
+    await q.answer("Fatto")
+    note = await _after_fix(ctx, ctx.user_data, where, idx)
+    if note or it["st1"] == it["st2"] == "ok":
+        text, kb = _list_view(ctx.user_data, where)
+        await q.edit_message_text(note + text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    else:
+        text, kb = _fix_menu(it, where, idx + 1)
+        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+async def _fix_typed(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Nome scritto a mano dopo ⌨️: lo abbina ai giocatori salvati (se lo riconosce usa il nome salvato)."""
+    pending = ctx.user_data.get("fix_typing")
+    if not pending or not is_admin(update, ctx):
+        return False
+    text = (update.effective_message.text or "").strip()
+    if not text or "\n" in text or len(text) > 100:
+        await reply(update, "Scrivi un solo nome (max 100 caratteri).")
+        return True
+    ctx.user_data.pop("fix_typing", None)
+    where, idx, slot = pending["where"], pending["idx"], pending["slot"]
+    items = _fix_items(ctx.user_data, where)
+    if not items or not 0 <= idx < len(items):
+        await reply(update, "Elenco scaduto.")
+        return True
+    it = items[idx]
+    r = ocr.resolve_name(text, await _known_names(ctx))
+    it[f"p{slot}"] = r.name if r.status == "ok" else text
+    it[f"st{slot}"], it[f"h{slot}"], it[f"r{slot}"] = "ok", None, text
+    note = await _after_fix(ctx, ctx.user_data, where, idx)
+    msg, kb = _list_view(ctx.user_data, where)
+    await reply(update, note + msg, reply_markup=kb)
+    return True
 
 
 # ---------------------------------------------------------------- step 4: classifiche
@@ -2529,6 +2677,7 @@ def setup(app: Application) -> None:
     app.add_handler(CallbackQueryHandler(cb_lookup_match_answer, pattern=r"^l(ok|no):"))
     app.add_handler(CallbackQueryHandler(cb_lookup_session_answer, pattern=r"^ls(ok|no):"))
     app.add_handler(CallbackQueryHandler(cb_paste_answer, pattern=r"^lp(ok|no)$"))
+    app.add_handler(CallbackQueryHandler(cb_fix, pattern=r"^fx:"))
     app.add_handler(CallbackQueryHandler(cb_publish, pattern=r"^pub:"))
     app.add_handler(CallbackQueryHandler(cb_ranking, pattern=r"^rk:"))
     app.add_handler(CallbackQueryHandler(cb_matches_to_group, pattern=r"^ptg:"))
