@@ -6,6 +6,7 @@ import dataclasses
 import json
 import re
 import logging
+import time
 import warnings
 from datetime import datetime, timedelta, timezone
 from html import escape
@@ -18,7 +19,7 @@ from telegram.ext import (Application, CallbackQueryHandler, ChatMemberHandler, 
 
 from telegram.warnings import PTBUserWarning
 
-from . import bracket, images, livescore
+from . import bracket, images, livescore, ocr
 from .config import Config
 from .db import DB, Event, Match, Session
 from .parsing import ParseError, competition_positions, fmt_dt, parse_matches, parse_start
@@ -142,6 +143,8 @@ HELP_ADMIN = (
     "/risultato_partita <i>id_partita</i> – dai/correggi il risultato di una sola partita (o tocca ✏️ in /sessioni)\n"
     "/cerca_risultati <i>id</i> – cerca su TheSportsDB i risultati mancanti della sessione (o tocca 🔎 in /sessioni)\n"
     "📋 <i>incolla in chat i risultati copiati da diretta.it</i> – il bot li abbina alle partite e li salva con ✅\n"
+    "📷 <i>manda uno o più screenshot di diretta.it</i> – partite finite: propone i risultati da salvare; "
+    "da giocare: dice quali sono già in una sessione e crea le altre (anche dentro /crea_sessione)\n"
     "Risultato: tocca il vincitore e poi i punti, oppure scrivi i punti <code>2 3</code> (giocatore 1, giocatore 2)\n"
     "/delete_event <i>id o nome</i> – elimina un evento (con o senza le sue sessioni)\n"
     "/delete_session <i>id</i> – elimina una sessione con partite e voti\n"
@@ -223,13 +226,20 @@ async def new_session_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> in
         await reply(update, "Nome non valido (max 120 caratteri). Riprova.")
         return ASK_NAME
     ctx.user_data["new"]["name"] = name
+    if ctx.user_data["new"].get("draft") is not None:  # partite già lette dagli screenshot
+        await _send_draft(ctx, update.effective_chat.id, ctx.user_data)
+        return ASK_MATCHES
     await reply(update, "2/3 – Mandami le partite, <b>una per riga</b>, nel formato\n"
                         "<code>GIOCATORE 1 - GIOCATORE 2</code>\n\nEsempio:\n"
-                        "<code>Rossi - Bianchi\nVerdi - Neri</code>")
+                        "<code>Rossi - Bianchi\nVerdi - Neri</code>\n\n"
+                        "📷 Oppure mandami gli screenshot delle partite da diretta.it (anche più di uno).")
     return ASK_MATCHES
 
 
 async def new_session_matches(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    data = ctx.user_data["new"]
+    if data.get("draft") is not None:  # elenco da screenshot: il testo corregge o aggiunge partite
+        return await _draft_text_input(update, ctx)
     try:
         matches = parse_matches(update.message.text)
     except ParseError as e:
@@ -245,9 +255,21 @@ async def new_session_matches(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def new_session_time(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _session_summary(update, ctx, update.message.text)
+
+
+async def new_session_time_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    """Bottone con l'orario della prima partita letto dagli screenshot."""
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_reply_markup(None)
+    return await _session_summary(update, ctx, q.data.split(":", 1)[1])
+
+
+async def _session_summary(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str) -> int:
     c = cfg(ctx)
     try:
-        start = parse_start(update.message.text, c.tz)
+        start = parse_start(text, c.tz)
     except ParseError as e:
         await reply(update, f"⚠️ {escape(str(e))}")
         return ASK_START
@@ -1396,6 +1418,13 @@ async def on_pasted_results(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> b
     results, skipped = livescore.parse_diretta(update.effective_message.text)
     if not results:
         return False
+    await _offer_results(ctx, ctx.user_data, lambda t, **kw: reply(update, t, **kw), results, skipped)
+    return True
+
+
+async def _offer_results(ctx: ContextTypes.DEFAULT_TYPE, user_data: dict, send, results, skipped: int,
+                         icon: str = "📋", unmatched_text: str = "righe senza partita corrispondente") -> None:
+    """Abbina i risultati letti alle partite senza risultato delle sessioni recenti e propone ✅ Salva."""
     d = db(ctx)
     now = now_utc()
     sessions = [s for s in await d.list_sessions(20, by_start=True)
@@ -1404,23 +1433,22 @@ async def on_pasted_results(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> b
     found = livescore.match_results(missing, results)
     note = f"\n({skipped} partite non ancora finite, saltate)" if skipped else ""
     if not found:
-        await reply(update, f"📋 Ho letto {len(results)} risultati ma nessuno corrisponde a una partita senza "
-                            f"risultato delle sessioni di questi giorni.{note}\nControlla con /sessioni.")
-        return True
+        await send(f"{icon} Ho letto {len(results)} risultati ma nessuno corrisponde a una partita senza "
+                   f"risultato delle sessioni di questi giorni.{note}\nControlla con /sessioni.")
+        return
     names = {s.id: s.name for s in sessions}
     by_session: dict[int, list[str]] = {}
     for m in missing:
         if m.id in found:
             by_session.setdefault(m.session_id, []).append(_found_text(m, found[m.id]))
     blocks = [f"📁 <b>{escape(names[sid])}</b>\n" + "\n".join(lines) for sid, lines in by_session.items()]
-    ctx.user_data["paste"] = {m_id: [f.winner, f.score1, f.score2] for m_id, f in found.items()}
+    user_data["paste"] = {m_id: [f.winner, f.score1, f.score2] for m_id, f in found.items()}
     unmatched = len(results) - len(found)
-    extra = f"\n({unmatched} righe senza partita corrispondente)" if unmatched > 0 else ""
-    await reply(update, f"📋 Trovati {len(found)} risultati:\n\n" + "\n\n".join(blocks) + note + extra
-                + "\n\nLi salvo?", reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton(f"✅ Salva {len(found)}", callback_data="lpok"),
-                    InlineKeyboardButton("❌ Annulla", callback_data="lpno")]]))
-    return True
+    extra = f"\n({unmatched} {unmatched_text})" if unmatched > 0 else ""
+    await send(f"{icon} Trovati {len(found)} risultati:\n\n" + "\n\n".join(blocks) + note + extra
+               + "\n\nLi salvo?", reply_markup=InlineKeyboardMarkup([[
+                   InlineKeyboardButton(f"✅ Salva {len(found)}", callback_data="lpok"),
+                   InlineKeyboardButton("❌ Annulla", callback_data="lpno")]]))
 
 
 async def cb_paste_answer(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1452,6 +1480,325 @@ async def cb_paste_answer(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         else:
             await ctx.bot.send_message(q.message.chat.id, f"Sessione #{sid}: mancano ancora {left} risultati "
                                                           f"(/risultati_sessione {sid}).")
+
+
+# ---------------------------------------------------------------- screenshot di diretta.it (OCR)
+
+SHOT_WINDOW = 600        # secondi: le foto mandate entro 10 minuti si sommano
+SHOT_DEBOUNCE = 2.5      # secondi di attesa dopo l'ultima foto (album) prima di rispondere
+
+
+async def _photo_bytes(update: Update) -> bytes | None:
+    msg = update.effective_message
+    if msg.photo:
+        f = await msg.photo[-1].get_file()
+    elif msg.document and (msg.document.mime_type or "").startswith("image/"):
+        f = await msg.document.get_file()
+    else:
+        return None
+    return bytes(await f.download_as_bytearray())
+
+
+async def _ocr_photo(update: Update) -> list[ocr.ShotMatch] | None:
+    data = await _photo_bytes(update)
+    if data is None:
+        return None
+    try:
+        return await ocr.read_image(data)
+    except ocr.OcrError as e:
+        log.warning("OCR: %s", e)
+        await reply(update, f"⚠️ Non riesco a leggere la foto: {escape(str(e))}")
+        return None
+
+
+def _later(ctx: ContextTypes.DEFAULT_TYPE, update: Update, callback) -> bool:
+    """Rimanda la risposta di qualche secondo (le foto di un album arrivano una alla volta).
+    Ritorna False se non c'è la job queue: allora si risponde subito."""
+    jq = getattr(ctx, "job_queue", None)
+    if jq is None:
+        return False
+    uid = update.effective_user.id
+    name = f"shots:{uid}"
+    for job in jq.get_jobs_by_name(name):
+        job.schedule_removal()
+    jq.run_once(callback, SHOT_DEBOUNCE, chat_id=update.effective_chat.id, user_id=uid, name=name)
+    return True
+
+
+async def _known_names(ctx: ContextTypes.DEFAULT_TYPE) -> list[str]:
+    return ocr.order_known(await db(ctx).known_player_names())
+
+
+async def _recent_matches(ctx: ContextTypes.DEFAULT_TYPE) -> list[tuple[Match, Session]]:
+    """Partite delle sessioni da 2 giorni fa a fra 3 giorni: servono per dire "già presente"."""
+    d = db(ctx)
+    now = now_utc()
+    out = []
+    for s in await d.sessions_between(now - timedelta(days=2), now + timedelta(days=3)):
+        out += [(m, s) for m in await d.get_matches(s.id)]
+    return out
+
+
+def _resolve_pair(p1: str, p2: str, known: list[str], time_: str | None = None) -> dict:
+    r1, r2 = ocr.resolve_name(p1, known), ocr.resolve_name(p2, known)
+    return {"p1": r1.name, "p2": r2.name, "st1": r1.status, "st2": r2.status, "h1": r1.hint, "h2": r2.hint,
+            "time": time_}
+
+
+def _present(item: dict, existing: list[tuple[Match, Session]]) -> Session | None:
+    for m, s in existing:
+        if ocr.same_match(item["p1"], item["p2"], m.player1, m.player2):
+            return s
+    return None
+
+
+def _draft_name(name: str, status: str, hint: str | None) -> str:
+    if status == "new":
+        return f"{escape(name)} <i>(nuovo)</i>"
+    if status == "unsure":
+        return f"{escape(name)} <i>(forse {escape(hint or '?')})</i>"
+    return escape(name)
+
+
+def _draft_line(i: int, it: dict) -> str:
+    icon = "✅" if it["st1"] == it["st2"] == "ok" else "⚠️"
+    t = f" · {it['time']}" if it.get("time") else ""
+    return (f"{i}. {icon} {_draft_name(it['p1'], it['st1'], it.get('h1'))} - "
+            f"{_draft_name(it['p2'], it['st2'], it.get('h2'))}{t}")
+
+
+def _draft_message(data: dict) -> tuple[str, InlineKeyboardMarkup]:
+    draft = data.get("draft") or []
+    lines = [_draft_line(i, it) for i, it in enumerate(draft, 1)]
+    head = f"2/3 – <b>{escape(data.get('name', ''))}</b>: {len(draft)} partite"
+    body = "\n".join(lines) if lines else "<i>(nessuna partita)</i>"
+    present = data.get("present") or []
+    extra = ""
+    if present:
+        extra = (f"\n\n📌 Già nelle sessioni, non aggiunte ({len(present)}):\n"
+                 + "\n".join(f"• {escape(p)}" for p in present))
+    help_ = ("\n\n✅ = nomi già conosciuti dal bot · ⚠️ = nome nuovo o incerto: controllalo.\n"
+             "Tocca ✏️ per correggere una partita, 🗑 per toglierla. Puoi mandare altre foto o scrivere altre "
+             "partite (<code>GIOCATORE 1 - GIOCATORE 2</code>, una per riga).")
+    rows, row = [], []
+    for i in range(1, len(draft) + 1):
+        row += [InlineKeyboardButton(f"✏️ {i}", callback_data=f"nd:e:{i}"),
+                InlineKeyboardButton(f"🗑 {i}", callback_data=f"nd:d:{i}")]
+        if len(row) == 8:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    last = [InlineKeyboardButton("❌ Annulla", callback_data="nd:x")]
+    if draft:
+        last.insert(0, InlineKeyboardButton(f"➡️ Avanti ({len(draft)})", callback_data="nd:ok"))
+    rows.append(last)
+    return f"{head}\n\n{body}{extra}{help_}", InlineKeyboardMarkup(rows)
+
+
+async def _send_draft(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, user_data: dict) -> None:
+    data = user_data.get("new")
+    if not data or data.get("draft") is None:
+        return
+    text, kb = _draft_message(data)
+    await ctx.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+async def _job_send_draft(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await _send_draft(ctx, ctx.job.chat_id, ctx.user_data)
+
+
+def _add_to_draft(data: dict, items: list[dict], existing: list[tuple[Match, Session]]) -> None:
+    draft = data.setdefault("draft", [])
+    present = data.setdefault("present", [])
+    for it in items:
+        if any(ocr.same_match(it["p1"], it["p2"], o["p1"], o["p2"]) for o in draft):
+            continue  # doppione (screenshot che si sovrappongono)
+        s = _present(it, existing)
+        if s is not None:
+            label = f"{it['p1']} - {it['p2']} (#{s.id} {s.name})"
+            if label not in present:
+                present.append(label)
+            continue
+        draft.append(it)
+
+
+async def new_session_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    """Screenshot mandato al punto 2 di /crea_sessione: le partite lette entrano nell'elenco."""
+    found = await _ocr_photo(update)
+    if found is None:
+        return ASK_MATCHES
+    data = ctx.user_data["new"]
+    known = await _known_names(ctx)
+    items = [_resolve_pair(m.p1, m.p2, known, m.time) for m in found]
+    _add_to_draft(data, items, await _recent_matches(ctx))
+    if not _later(ctx, update, _job_send_draft):
+        await _send_draft(ctx, update.effective_chat.id, ctx.user_data)
+    return ASK_MATCHES
+
+
+async def _draft_text_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    """Testo scritto mentre c'è l'elenco da screenshot: correzione di una partita (dopo ✏️) o partite in più."""
+    data = ctx.user_data["new"]
+    try:
+        typed = parse_matches(update.message.text)
+    except ParseError as e:
+        await reply(update, f"⚠️ {escape(str(e))}")
+        return ASK_MATCHES
+    known = await _known_names(ctx)
+    items = [_resolve_pair(p1, p2, known) for p1, p2 in typed]
+    idx = data.pop("edit", None)
+    draft = data["draft"]
+    if idx is not None and 0 <= idx < len(draft):
+        items[0]["time"] = draft[idx].get("time")
+        draft[idx] = items[0]
+        items = items[1:]
+    for it in items:
+        if not any(ocr.same_match(it["p1"], it["p2"], o["p1"], o["p2"]) for o in draft):
+            draft.append(it)
+    await _send_draft(ctx, update.effective_chat.id, ctx.user_data)
+    return ASK_MATCHES
+
+
+async def new_session_draft_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    data = ctx.user_data.get("new")
+    if not data or data.get("draft") is None:
+        await q.answer("Elenco scaduto", show_alert=True)
+        return ConversationHandler.END
+    parts = q.data.split(":")
+    action = parts[1]
+    draft = data["draft"]
+    if action in ("e", "d"):
+        idx = int(parts[2]) - 1
+        if not 0 <= idx < len(draft):
+            await q.answer("Partita non trovata")
+            return ASK_MATCHES
+        if action == "d":
+            del draft[idx]
+            data.pop("edit", None)
+            await q.answer("Tolta")
+            text, kb = _draft_message(data)
+            await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+            return ASK_MATCHES
+        await q.answer()
+        data["edit"] = idx
+        it = draft[idx]
+        await reply(update, f"✏️ Scrivi la partita {idx + 1} corretta, es.\n"
+                            f"<code>{escape(it['p1'])} - {escape(it['p2'])}</code>")
+        return ASK_MATCHES
+    if action == "x":
+        await q.answer()
+        ctx.user_data.pop("new", None)
+        await q.edit_message_reply_markup(None)
+        await reply(update, "Creazione annullata.")
+        return ConversationHandler.END
+    # avanti
+    if not draft:
+        await q.answer("Nessuna partita", show_alert=True)
+        return ASK_MATCHES
+    await q.answer()
+    await q.edit_message_reply_markup(None)
+    data["matches"] = [(it["p1"], it["p2"]) for it in draft]
+    data.pop("edit", None)
+    c = cfg(ctx)
+    times = sorted(it["time"] for it in draft if it.get("time"))
+    kb = None
+    if times:
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"⏰ {times[0]} (prima partita)",
+                                                         callback_data=f"nt:{times[0]}")]])
+    await reply(update, f"Ok, {len(draft)} partite.\n\n3/3 – A che ora inizia la sessione?\n"
+                        f"Esempi: <code>25/11/2026 15:30</code>, <code>domani 15:30</code>, <code>15:30</code>\n"
+                        f"(fuso orario {c.tz.key}; i sondaggi si chiudono {c.close_minutes_before} minuti prima)",
+                reply_markup=kb)
+    return ASK_START
+
+
+async def new_session_from_shots(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    """Bottone «Crea sessione» sotto il resoconto degli screenshot."""
+    q = update.callback_query
+    if not is_admin(update, ctx):
+        await q.answer("Solo admin", show_alert=True)
+        return ConversationHandler.END
+    drafts = ctx.user_data.pop("shot_new", None)
+    await q.answer()
+    await q.edit_message_reply_markup(None)
+    if not drafts:
+        await reply(update, "Elenco scaduto: rimanda gli screenshot.")
+        return ConversationHandler.END
+    ctx.user_data["new"] = {"draft": drafts, "present": []}
+    await reply(update, f"🆕 Nuova sessione con {len(drafts)} partite.\n\n1/3 – Come si chiama? "
+                        "(es. <i>Sabato pomeriggio</i>)\n\n/annulla per uscire.")
+    return ASK_NAME
+
+
+async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Screenshot mandato in privato dall'admin (fuori da /crea_sessione): risultati da salvare oppure
+    partite da giocare (dice quali sono già in una sessione e propone di creare le altre)."""
+    if not is_admin(update, ctx):
+        return
+    found = await _ocr_photo(update)
+    if found is None:
+        return
+    buf = ctx.user_data.get("shots")
+    now = time.time()
+    if not buf or now - buf.get("t", 0) > SHOT_WINDOW:
+        buf = {"items": [], "n": 0}
+    buf["t"] = now
+    buf["n"] += 1
+    buf["items"] += [dataclasses.asdict(m) for m in found]
+    ctx.user_data["shots"] = buf
+    if not _later(ctx, update, _job_shots_report):
+        await _shots_report(ctx, update.effective_chat.id, ctx.user_data)
+
+
+async def _job_shots_report(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await _shots_report(ctx, ctx.job.chat_id, ctx.user_data)
+
+
+async def _shots_report(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, user_data: dict) -> None:
+    buf = user_data.get("shots") or {}
+    items = ocr.dedupe([ocr.ShotMatch(**d) for d in buf.get("items", [])])
+    n = buf.get("n", 1)
+    photos = "nella foto" if n == 1 else f"nelle {n} foto"
+
+    async def send(text: str, **kw):
+        return await ctx.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML, **kw)
+
+    if not items:
+        await send(f"📷 Non ho trovato partite {photos}. Serve uno screenshot dell'elenco partite di diretta.it "
+                   "(righe «Cognome I.»); le partite tagliate sul bordo le salto.")
+        return
+    done = [m for m in items if m.finished]
+    todo = [m for m in items if not m.finished]
+    if done:
+        results = [(m.p1, m.s1, m.s2, m.p2, f"{m.p1} {m.s1}-{m.s2} {m.p2}") for m in done]
+        await _offer_results(ctx, user_data, send, results, 0, icon="📷",
+                             unmatched_text="partite lette non sono tra quelle senza risultato")
+    if not todo:
+        return
+    known = await _known_names(ctx)
+    existing = await _recent_matches(ctx)
+    present, new = [], []
+    for m in todo:
+        it = _resolve_pair(m.p1, m.p2, known, m.time)
+        s = _present(it, existing)
+        (present if s else new).append((it, s))
+    lines = [f"📷 Ho letto {len(todo)} partite da giocare {photos}."]
+    if present:
+        lines.append(f"\n📌 Già presenti ({len(present)}):")
+        lines += [f"• {escape(it['p1'])} - {escape(it['p2'])} → #{s.id} {escape(s.name)}" for it, s in present]
+    kb = None
+    if new:
+        lines.append(f"\n🆕 Non ancora in una sessione ({len(new)}):")
+        lines += [_draft_line(i, it) for i, (it, _) in enumerate(new, 1)]
+        user_data["shot_new"] = [it for it, _ in new]
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"🆕 Crea sessione con queste {len(new)}",
+                                                         callback_data="shot:new")]])
+    else:
+        user_data.pop("shot_new", None)
+        lines.append("\n✅ Ci sono già tutte, non serve creare niente.")
+    await send("\n".join(lines), reply_markup=kb)
 
 
 # ---------------------------------------------------------------- step 4: classifiche
@@ -2110,11 +2457,15 @@ def setup(app: Application) -> None:
     # Il bottone "Salva" è nell'ultimo messaggio della conversazione: per_message non serve.
     warnings.filterwarnings("ignore", message="If 'per_message=False'", category=PTBUserWarning)
     conv = ConversationHandler(
-        entry_points=[CommandHandler("crea_sessione", new_session_start, filters=private)],
+        entry_points=[CommandHandler("crea_sessione", new_session_start, filters=private),
+                      CallbackQueryHandler(new_session_from_shots, pattern=r"^shot:new$")],
         states={
             ASK_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, new_session_name)],
-            ASK_MATCHES: [MessageHandler(filters.TEXT & ~filters.COMMAND, new_session_matches)],
-            ASK_START: [MessageHandler(filters.TEXT & ~filters.COMMAND, new_session_time)],
+            ASK_MATCHES: [MessageHandler(filters.TEXT & ~filters.COMMAND, new_session_matches),
+                          MessageHandler(filters.PHOTO | filters.Document.IMAGE, new_session_photo),
+                          CallbackQueryHandler(new_session_draft_cb, pattern=r"^nd:")],
+            ASK_START: [MessageHandler(filters.TEXT & ~filters.COMMAND, new_session_time),
+                        CallbackQueryHandler(new_session_time_cb, pattern=r"^nt:")],
             ASK_CONFIRM: [CallbackQueryHandler(new_session_confirm, pattern=r"^new:")],
         },
         fallbacks=[CommandHandler("annulla", new_session_cancel)],
@@ -2186,6 +2537,7 @@ def setup(app: Application) -> None:
     app.add_handler(ChatMemberHandler(on_chat_member, ChatMemberHandler.CHAT_MEMBER))
     # gruppo separato: registra chi scrive anche quando un comando ha già gestito il messaggio
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, on_score_text))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & (filters.PHOTO | filters.Document.IMAGE), on_photo))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS, on_group_message), group=1)
     app.add_error_handler(on_error)
     app.job_queue.run_repeating(close_due_polls, interval=30, first=5, name="close_due_polls")

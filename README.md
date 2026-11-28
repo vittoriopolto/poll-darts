@@ -28,6 +28,8 @@ Stack: Python 3.12 · python-telegram-bot 22 · Postgres (Neon) · deploy su Ren
 | privato (admin) | `/risultato_partita ID` | dà o corregge il risultato di una sola partita (bottoni come in `/risultati_sessione`, più *Annulla*) |
 | privato (admin) | `/cerca_risultati ID` | cerca su TheSportsDB i risultati mancanti della sessione e li salva con un tasto (anche dal link 🔎 in `/sessioni`); sotto *Chi ha vinto?* c'è il tasto 🔎 *Cerca risultato* per una sola partita |
 | privato (admin) | *incolla testo* | incolla in chat i risultati copiati da diretta.it (blocchi Finale / giocatore / giocatore / punti / punti): il bot li abbina alle partite senza risultato delle sessioni di questi giorni e li salva con ✅ |
+| privato (admin) | 📷 *screenshot* | mandi uno o più screenshot di diretta.it (anche un album; vanno bene sovrapposti). Il bot legge le partite con l'OCR gratuito Tesseract, salta quelle tagliate sul bordo e i doppioni. **Partite finite**: abbina i punteggi alle partite senza risultato e propone ✅ Salva, come per il testo incollato. **Partite da giocare**: dice quali sono 📌 già in una sessione (di 2 giorni fa fino a fra 3 giorni) e propone 🆕 *Crea sessione* con le altre |
+| privato (admin) | `/crea_sessione` + 📷 | al punto 2, invece del testo, manda gli screenshot: arriva l'elenco con ✅ (nomi riconosciuti) o ⚠️ (nome nuovo o incerto), i tasti ✏️ N per correggere e 🗑 N per togliere, ➡️ *Avanti*; al punto 3 c'è il tasto con l'orario della prima partita. Le partite già in una sessione non vengono aggiunte |
 | privato (admin) | (punteggio) | quando il bot chiede *Chi ha vinto?*: **1)** tocchi il vincitore, poi i tasti 1️⃣–9️⃣ con i suoi punti, poi quelli del perdente (0️⃣ fino a uno meno del vincitore; c'è anche *Senza punteggio*); **2)** oppure scrivi i punti `2 3` (giocatore 1, spazio, giocatore 2) e il vincitore lo capisce da solo |
 | privato o gruppo (admin) | `/partite ID` | in testo: 🏆 nome evento, 📁 nome sessione, ⏰ orario di inizio e l'elenco delle partite (✓ giocata, con vincitore e punteggio in grassetto · ○ da giocare · 🚫 non disputata). In privato poi chiede con un bottone se mandarlo nel gruppo (quello in cui è stata lanciata la sessione, altrimenti quello dell'ultima sessione lanciata, altrimenti il gruppo in cui il bot ha visto attività più di recente); nel gruppo cancella il comando e lo manda come messaggio a sé |
 | privato (admin) | `/tabellone_imposta [ID o nome evento]` | salva il **tabellone** dell'evento (default: quello in corso): incolli le partite del 1° turno nell'ordine del tabellone, una per riga, es. `1 Wessel Nijman NED - 64 Henry Coates ENG` (testa di serie e nazione facoltative, vanno bene anche le bandiere 🇳🇱; prima riga facoltativa `Titolo: …`). Servono 2, 4, 8, 16, 32 o 64 partite. Il testo si può mettere anche nello stesso messaggio del comando, a capo. Rilanciandolo si sostituisce |
@@ -44,6 +46,10 @@ Stack: Python 3.12 · python-telegram-bot 22 · Postgres (Neon) · deploy su Ren
 | gruppo (admin) | `/muta`, `/smuta`, `/membri` | mute manuale; quanti membri il bot conosce |
 | privato (tutti) | `/impostazioni` | stato del tag con i bottoni ✅ Start Tag / 🛑 Stop Tag: con lo stop in classifica (testo, immagine, risultati feedback) compari col nome senza @, quindi niente notifica. Di default il tag è attivo |
 | ovunque | `/mio_id` | mostra il tuo ID Telegram (serve per `ADMIN_IDS`) |
+
+**Nomi letti dagli screenshot**: diretta.it scrive `Bialecki S.`; il bot lo abbina al giocatore già usato nelle
+partite o nei tabelloni (`Sebastian Białecki`, accenti e lettere come ł compresi) e salva sempre quel nome, preferendo
+il nome completo. Un nome mai visto resta come l'ha letto (⚠️ *nuovo*) e lo puoi correggere con ✏️.
 
 Formati orario accettati: `25/11/2026 15:30`, `25/11 15:30`, `domani 15:30`, `15:30` (fuso `Europe/Rome`).
 Separatori partite accettati: `-`, `–`, `vs`. Numerazione iniziale (`1)`, `1.`) ignorata.
@@ -104,8 +110,10 @@ Pubblica questa cartella in un repository GitHub (privato va benissimo).
 
 ### 4. Render
 1. [dashboard.render.com](https://dashboard.render.com) → **New → Blueprint** → scegli il repo:
-   legge `render.yaml` e crea il web service. (In alternativa *New → Web Service* con build
-   `pip install -r requirements.txt` e start `python -m pdc`.)
+   legge `render.yaml` e crea il web service con il `Dockerfile` (serve Docker per installare Tesseract,
+   l'OCR degli screenshot). In alternativa *New → Web Service* con *Language* **Docker**.
+   Servizio già esistente in Python: *Settings → Build → Source → Edit*, scegli *Runtime* **Docker** e *Deploy*
+   (le variabili d'ambiente restano). Senza Docker il bot funziona lo stesso, ma non legge le foto.
 2. Imposta le variabili: `BOT_TOKEN`, `DATABASE_URL`, `ADMIN_IDS`.
 3. Al deploy il bot registra da solo il webhook su `https://<tuo-servizio>.onrender.com/telegram`.
 
@@ -162,9 +170,11 @@ pdc/
   schema.sql    tabelle (create in automatico)
   parsing.py    lettura partite/orari, piazzamenti a pari merito
   images.py     copertina e classifica in PNG (Pillow)
+  ocr.py        lettura screenshot di diretta.it (Tesseract) e abbinamento dei nomi
 assets/logo.jpg logo PDC180 (usato nelle immagini)
 assets/fonts    DejaVu Sans e Liberation Sans (licenze libere)
-render.yaml     configurazione Render
+render.yaml     configurazione Render (Docker)
+Dockerfile      Python + Tesseract
 ```
 
 Punteggio: +1 per ogni voto uguale al vincitore. Pari merito stile sportivo (1, 1, 3…). Le partite

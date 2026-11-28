@@ -324,6 +324,22 @@ class DB:
             "WHERE s.event_id = $1 ORDER BY s.starts_at, m.position", event_id)
         return [Match(**dict(r)) for r in rows]
 
+    async def known_player_names(self, limit: int = 3000) -> list[str]:
+        """Nomi dei giocatori già usati, dal più recente (partite) e poi quelli dei tabelloni."""
+        rows = await self.pool.fetch(
+            "SELECT m.player1, m.player2 FROM matches m JOIN sessions s ON s.id = m.session_id "
+            "ORDER BY s.starts_at DESC, m.position LIMIT $1", limit)
+        names = [n for r in rows for n in (r["player1"], r["player2"])]
+        for r in await self.pool.fetch("SELECT draw FROM brackets ORDER BY updated_at DESC"):
+            names += [p[1] for p in json.loads(r["draw"]) if isinstance(p, list) and len(p) > 1 and p[1]]
+        return names
+
+    async def sessions_between(self, start: datetime, end: datetime) -> list[Session]:
+        rows = await self.pool.fetch(
+            "SELECT id, name, starts_at, created_by, chat_id, launched_at, closed_at, event_id FROM sessions "
+            "WHERE starts_at BETWEEN $1 AND $2 ORDER BY starts_at, id", start, end)
+        return [Session(**dict(r)) for r in rows]
+
     # ---------- partite ----------
 
     async def get_matches(self, session_id: int) -> list[Match]:
