@@ -117,3 +117,17 @@ def test_tesseract_real_image():
     assert [(m.p1, m.p2, m.time, m.finished) for m in got] == [
         ("Greaves B.", "Kist C.", "14:00", False), ("Bialecki S.", "Wattimena J.", "14:30", False),
         ("van Gerwen M.", "Labanauskas D.", "15:00", False)]
+
+
+def test_flag_junk_before_name():
+    # bandiera letta come parola maiuscola: vince il nome allineato alla colonna
+    words = rows_for([("Sedlacek K.", "Mansell M."), ("Greaves B.", "Owen R.")])
+    words += [w("Hi", 96, 700 + 62), w("Ea", 96, 700 + 160 + 62)]
+    got = ocr.parse_words(words, W)
+    assert [(m.p1, m.p2) for m in got] == [("Sedlacek K.", "Mansell M."), ("Greaves B.", "Owen R.")]
+    # e se arriva lo stesso, l'abbinamento lo toglie
+    known = ["Mickey Mansell", "James Hurrell"]
+    r = ocr.resolve_name("Hi Mansell M.", known)
+    assert (r.name, r.status, r.read) == ("Mickey Mansell", "ok", "Mansell M.")
+    assert ocr.resolve_name("La Ltd Hurrell J.", known).name == "James Hurrell"
+    assert ocr.resolve_name("Hi Rock J.", known).status == "new"

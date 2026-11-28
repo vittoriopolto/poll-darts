@@ -166,7 +166,9 @@ def parse_words(words: list[Word], width: int, score_reader=None) -> list[ShotMa
     names: list[_NameRow] = []
     loose: list[Word] = []  # parole fuori dai nomi: orari, "11 L", punti su righe separate
     for row in rows:
-        got = next((c for c in cands[id(row)] if abs(row[c[1]].left - column) <= tol * 2), None)
+        near = [c for c in cands[id(row)] if abs(row[c[1]].left - column) <= tol * 2]
+        # il più vicino alla colonna: "Hi Mansell M." (bandiera letta come testo) perde contro "Mansell M."
+        got = min(near, key=lambda c: abs(row[c[1]].left - column)) if near else None
         if got:
             name, start, nxt = got
             part = row[start:nxt]
@@ -315,22 +317,42 @@ class Resolved:
     name: str            # nome da usare (quello salvato se riconosciuto)
     status: str          # "ok" riconosciuto, "new" nuovo, "unsure" incerto
     read: str            # come l'ha letto l'OCR
-    hint: str | None = None  # per "unsure": il giocatore che potrebbe essere
+    hint: str | None = None  # per "unsure": il giocatore salvato che potrebbe essere
 
 
-def resolve_name(read: str, known: list[str]) -> Resolved:
-    """Abbina un nome letto ("Bialecki S.") a uno salvato ("Sebastian Białecki"). `known` da order_known."""
+def _variants(read: str) -> list[str]:
+    """'La Ltd Hurrell J.' -> ['La Ltd Hurrell J.', 'Ltd Hurrell J.', 'Hurrell J.']: parole spazzatura davanti
+    (bandiere lette come testo) tolte una alla volta, lasciando almeno cognome e iniziale."""
+    words = read.split()
+    return [" ".join(words[i:]) for i in range(max(1, len(words) - 1))]
+
+
+def _resolve_one(read: str, known: list[str]) -> Resolved:
     full = [k for k in known if name_score(k, read) == 2]
     if full:
         first = full[0]
         others = [k for k in full[1:] if name_score(first, k) < 2]
-        if others:
-            return Resolved(first, "unsure", read, f"{first} o {others[0]}?")
+        if others:  # due giocatori diversi con lo stesso cognome e iniziale
+            return Resolved(first, "unsure", read, others[0])
         return Resolved(first, "ok", read)
     part = [k for k in known if name_score(read, k) >= 1 or name_score(k, read) >= 1]
     if part:
         return Resolved(read, "unsure", read, part[0])
     return Resolved(read, "new", read)
+
+
+def resolve_name(read: str, known: list[str]) -> Resolved:
+    """Abbina un nome letto ("Bialecki S.") a uno salvato ("Sebastian Białecki"). `known` da order_known.
+
+    Se il nome intero non si riconosce si riprova togliendo le parole davanti ("Hi Mansell M." -> "Mansell M.")."""
+    res = [_resolve_one(v, known) for v in _variants(read.strip())]
+    for r in res:
+        if r.status == "ok":
+            return r
+    for r in res:
+        if r.status == "unsure":
+            return r
+    return res[0]  # nessun riscontro: resta come letto
 
 
 def same_player(a: str, b: str) -> bool:
